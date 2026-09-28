@@ -14,6 +14,7 @@ import path from "node:path";
 import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
 import { clusterOf, type ClusterAssignment, type ClusterIndex, type CueRegistry, validateRegistry } from "./clusters.ts";
+import { GUARD_IDS, type GuardId } from "./learning.ts";
 import type { Surface } from "./types.ts";
 
 export const PROFILE_FILE = "profile.json";
@@ -25,6 +26,8 @@ export interface WorkProfile {
   canonicalEntrypoints: Record<string, string>;
   capabilityTtlHours: number;
   cueRegistry?: CueRegistry;
+  /** Pre-action guards this profile turns on (see learning.ts GUARDS). */
+  guards?: GuardId[];
 }
 
 const DEFAULT_KERNEL = [
@@ -68,7 +71,15 @@ export function validateProfile(value: unknown): WorkProfile {
     canonicalEntrypoints: { ...entrypoints },
     capabilityTtlHours: ttl,
     ...(profile.cueRegistry ? { cueRegistry: validateRegistry(profile.cueRegistry) } : {}),
+    ...(profile.guards ? { guards: validateGuards(profile.guards) } : {}),
   };
+}
+
+function validateGuards(value: unknown): GuardId[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !(GUARD_IDS as string[]).includes(item))) {
+    throw new Error(`guards must be a list of: ${GUARD_IDS.join(", ")}`);
+  }
+  return [...new Set(value as GuardId[])];
 }
 
 export function loadProfile(root: string, file?: string): WorkProfile {

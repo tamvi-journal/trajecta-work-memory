@@ -20,7 +20,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, canonicalStoreDigest, OperationConflict, OperationInDoubt, writeAtomic } from "./store.ts";
-import { withRootWriteLock, type LockOptions } from "./lock.ts";
+import { holdsRootWriteLock, withRootWriteLock, type LockOptions } from "./lock.ts";
 
 export type JournalFaultPoint = "after-reserve" | "after-journal" | "after-projection";
 
@@ -215,6 +215,39 @@ export class DomainJournal<P, E extends JournalEvent> {
     this.fault?.("after-projection");
     appendJsonl(this.ledgerFile, { ...reservation, state: "committed" });
     return { event: structuredClone(event), projection: structuredClone(next.value), replayed: false };
+  }
+
+  // --- variants for a mutation that already holds the root lock -----------
+  //
+  // A mutation that spans several journals (for example promoting an incident
+  // into an invariant) takes the root lock once and uses these. They refuse to
+  // run without the lock, so nothing can read a half-written append.
+
+  private assertHeld() {
+    if (!holdsRootWriteLock(this.root)) throw new Error(`${this.spec.name}: this call needs the root write lock held by the caller`);
+  }
+
+  readHeld(): P {
+    this.assertHeld();
+    this.recoverPending();
+    return this.read();
+  }
+
+  eventsHeld(): E[] {
+    this.assertHeld();
+    return this.eventsLocked();
+  }
+
+  replayHeld(operationId: string, input: unknown): { event: E; projection: P } | null {
+    this.assertHeld();
+    assertOperationId(operationId);
+    return this.replay(operationId, input);
+  }
+
+  appendHeld(operationId: string, input: unknown, build: (projection: P, now: string) => Omit<E, keyof JournalEvent>) {
+    this.assertHeld();
+    assertOperationId(operationId);
+    return this.appendLocked(operationId, input, build);
   }
 
   private ledger() {

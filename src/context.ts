@@ -13,6 +13,7 @@
 import type { TrajectaStore } from "./store.ts";
 import type { DomainJournal } from "./journal.ts";
 import { clusterOf, membersOf, type ClusterAssignment, type ClusterIndex } from "./clusters.ts";
+import type { LearningLayer } from "./learning.ts";
 import type { Delta } from "./types.ts";
 
 export type ContextMode = "normal" | "debug" | "audit";
@@ -69,6 +70,7 @@ export function workContext(
   store: TrajectaStore,
   clusters: DomainJournal<ClusterIndex, ClusterAssignment> | null,
   input: ContextInput,
+  learning: LearningLayer | null = null,
 ) {
   const budget = input.budgetChars ?? 6_000;
   if (!Number.isInteger(budget) || budget < 800 || budget > 60_000) throw new Error("budget_chars must be an integer in 800..60000");
@@ -120,6 +122,25 @@ export function workContext(
     resume_rule: `Resume only ${item.id} at revision ${item.revision}. Memory is context, not authority.`,
     deltas: [] as unknown[],
   };
+  // Learning layer: accepted rules in every mode; incident summaries in
+  // debug; raw incidents and chronicle in audit. Candidates are never rules.
+  const workCluster = clusterOf(index, item.id);
+  const learned = learning ? {
+    prevention_rules: learning.rulesFor(workCluster).map((rule) => ({ id: rule.invariantId, rule: rule.rule, approval_ref: rule.approvalRef })),
+    ...(input.mode === "debug" ? { incident_summaries: learning.incidentSummaries({ workId: item.id, cluster: workCluster }) } : {}),
+    ...(input.mode === "audit" ? (() => {
+      const trail = learning.auditTrail(item.id, workCluster);
+      return {
+        incidents: trail.incidents.map((incident) => ({
+          id: incident.id, kind: incident.kind, summary: incident.summary, violated_invariant: incident.violatedInvariant,
+          evidence_refs: incident.evidenceRefs, correction: incident.correction, prevention_rule: incident.preventionRule,
+          tier: incident.tier, recorded_at: incident.recordedAt,
+        })),
+        chronicle: trail.chronicle.map((milestone) => ({ id: milestone.id, stage: milestone.stage, summary: milestone.summary, provenance: milestone.provenance, recorded_at: milestone.recordedAt })),
+      };
+    })() : {}),
+  } : {};
+  Object.assign(base, learned);
   const { deltas: _none, ...fixed } = base;
   return fitList((kept, dropped) => ({ ...fixed, deltas: kept, budget: { chars: budget, used: 0, dropped } }), recent.map(compactDelta), budget, "start");
 }
