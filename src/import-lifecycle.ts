@@ -95,6 +95,7 @@ export interface ImportReport {
     cluster: string;
     events: number;
     revision: number;
+    sourceRevision: number;
     closedInSource: boolean;
     matches: { openLoops: boolean; nextAction: boolean; goal: boolean };
   }>;
@@ -126,6 +127,8 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
   for (const task of projection.tasks) {
     const taskEvents = events.filter((event) => event.task_id === task.task_id).sort((left, right) => left.revision - right.revision);
     const open = taskEvents.find((event) => event.kind === "open");
+    // Later "open" events on the same task are resumes (AWM/LWM reopen an
+    // exact task id with work_open); only the first one created the task.
     const firstSurface = surfaceOf(open?.surface ?? taskEvents[0]?.surface ?? source, open?.session_id ?? "");
     const opened = store.open({
       operationId: op("open", task.task_id),
@@ -137,12 +140,22 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
     let work: WorkItem = opened.work;
     const branchIds = new Map<string, string>();
     const anchorIds: string[] = [];
-    const rest = taskEvents.filter((event) => event.kind !== "open");
+    const rest = taskEvents.filter((event) => event !== open);
     let closed = false;
 
     rest.forEach((event, position) => {
       const last = position === rest.length - 1;
       const surface = surfaceOf(event.surface, event.session_id);
+      if (event.kind === "open") {
+        work = store.resume({
+          operationId: op("event", event.event_id),
+          workId: work.id,
+          expectedRevision: work.revision,
+          surface,
+          instruction: event.summary.slice(0, 1_000),
+        }).work;
+        return;
+      }
       const provenance = [...(event.provenance_refs ?? []), `source:${source}:${event.event_id}`].slice(0, 20);
       let kind: DeltaKind | undefined = DIRECT[event.kind];
       let summary = event.summary;
@@ -187,7 +200,9 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
       if (kind === "contract_anchor") anchorIds.push(result.delta.id);
     });
 
-    if (!rest.length && (task.open_loops.length || task.next_action)) {
+    const current = store.getWork(work.id);
+    const stateDiffers = JSON.stringify(current.openLoops) !== JSON.stringify(task.open_loops) || current.nextAction !== task.next_action;
+    if (stateDiffers && !closed) {
       work = store.capture({
         operationId: op("state", task.task_id),
         workId: work.id,
@@ -217,6 +232,7 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
       cluster: task.cluster,
       events: taskEvents.length,
       revision: final.revision,
+      sourceRevision: task.revision,
       closedInSource: closed || ["complete", "abandoned"].includes(task.status),
       matches: {
         openLoops: JSON.stringify(final.openLoops) === JSON.stringify(task.open_loops),

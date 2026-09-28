@@ -5,7 +5,7 @@
       "task_id": "task:11111111-aaaa",
       "cluster": "memory-system",
       "status": "waiting",
-      "revision": 9,
+      "revision": 10,
       "goal": "Move memory to the shared backbone. Keep history.",
       "current_instruction": "Implement phase 1.",
       "verification_state": "unverified",
