@@ -122,11 +122,36 @@ function writeOwner(dir: string, owner: LockOwner) {
   } finally {
     fs.closeSync(descriptor);
   }
-  fs.renameSync(temporary, path.join(dir, OWNER_FILE));
+  retrying(() => fs.renameSync(temporary, path.join(dir, OWNER_FILE)));
+}
+
+const TRANSIENT = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
+
+/**
+ * Windows refuses to delete or rename while another process has a file in
+ * the directory open, even for the instant it takes to read owner.json.
+ * Retry those transient errors briefly, and confirm the directory is gone.
+ */
+function retrying<T>(action: () => T, attempts = 40): T {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return action();
+    } catch (error) {
+      if (attempt >= attempts || !TRANSIENT.has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+      sleep(Math.min(5 * attempt, 50));
+    }
+  }
 }
 
 function removeDir(dir: string) {
-  fs.rmSync(dir, { recursive: true, force: true });
+  retrying(() => {
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 5 });
+    if (fs.existsSync(dir)) {
+      const error = new Error(`Could not remove ${dir}`) as NodeJS.ErrnoException;
+      error.code = "ENOTEMPTY";
+      throw error;
+    }
+  });
 }
 
 function tryMkdir(dir: string) {
@@ -149,7 +174,12 @@ function recoverStale(root: string, observed: LockOwner, nonce: string, options:
     // Only the exact dead owner we observed may be removed.
     if (!current || current.nonce !== observed.nonce || current.hostname !== options.hostname || options.isAlive(current.pid)) return false;
     const quarantine = path.join(root, `${LOCK_DIR}.stale-${nonce}`);
-    fs.renameSync(lockDir, quarantine);
+    try {
+      retrying(() => fs.renameSync(lockDir, quarantine));
+    } catch (error) {
+      if (TRANSIENT.has((error as NodeJS.ErrnoException).code ?? "")) return false; // try again on the next round
+      throw error;
+    }
     removeDir(quarantine);
     lockStats.staleRecovered += 1;
     return true;
