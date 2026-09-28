@@ -123,7 +123,12 @@ export class DomainJournal<P, E extends JournalEvent> {
     return this.clock();
   }
 
+  /** All events, read under the root lock so no append is half-seen. */
   events(): E[] {
+    return withRootWriteLock(this.root, () => this.eventsLocked(), this.lockOptions);
+  }
+
+  private eventsLocked(): E[] {
     return readLines(this.journalFile).map((value) => {
       if (!this.spec.isEvent(value)) throw new OperationInDoubt();
       return value;
@@ -147,8 +152,13 @@ export class DomainJournal<P, E extends JournalEvent> {
   }
 
   /** Fold the journal from scratch; must equal the stored projection. */
+  /** Fold the journal from scratch, under the root lock. */
   rebuild(): P {
-    return this.events().reduce((projection, event) => this.spec.apply(projection, event), this.spec.empty());
+    return withRootWriteLock(this.root, () => this.rebuildLocked(), this.lockOptions);
+  }
+
+  private rebuildLocked(): P {
+    return this.eventsLocked().reduce((projection, event) => this.spec.apply(projection, event), this.spec.empty());
   }
 
   /** Journal and projection agree. Takes the root lock so no writer is mid-commit. */
@@ -158,8 +168,8 @@ export class DomainJournal<P, E extends JournalEvent> {
 
   private verifyLocked() {
     const stored = this.readProjectionFile();
-    const events = this.events();
-    return stored.events === events.length && canonicalStoreDigest(stored.value) === canonicalStoreDigest(this.rebuild());
+    const events = this.eventsLocked();
+    return stored.events === events.length && canonicalStoreDigest(stored.value) === canonicalStoreDigest(this.rebuildLocked());
   }
 
   /**
@@ -249,7 +259,7 @@ export class DomainJournal<P, E extends JournalEvent> {
   private reconcile(reservation: LedgerRecord<P, E>) {
     const current = canonicalStoreDigest(this.readProjectionFile());
     if (current !== reservation.beforeProjectionDigest && current !== reservation.nextProjectionDigest) throw new OperationInDoubt();
-    const matching = this.events().filter((event) => event.operationId === reservation.operationId);
+    const matching = this.eventsLocked().filter((event) => event.operationId === reservation.operationId);
     if (matching.length > 1) throw new OperationInDoubt();
     if (matching.length && canonicalStoreDigest(matching[0]) !== canonicalStoreDigest(reservation.event)) throw new OperationInDoubt();
     if (!matching.length) appendJsonl(this.journalFile, reservation.event);

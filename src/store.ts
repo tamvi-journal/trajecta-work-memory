@@ -633,10 +633,22 @@ export class TrajectaStore {
    * accepts no further capture or resume.
    */
   close(input: CloseWorkInput) {
-    return this.locked(() => this.closeLocked(input));
+    // Stage 1 (locked): an already-committed close replays without touching
+    // the verifier.
+    const done = this.locked(() => this.replay(input.operationId, input));
+    if (done) return done;
+    // Stage 2 (no lock): resolve the receipt. The verifier may do slow I/O or
+    // read Trajecta itself; holding the root lock here would block every
+    // writer or re-enter the lock.
+    if (!this.resolveReceipt) throw new Error("Closing work needs a receipt verifier; this store has none configured");
+    const receipt = this.resolveReceipt(input.verificationRef);
+    // Stage 3 (locked): replay again, recover, re-read, CAS, then check the
+    // receipt against the exact request at commit time. If the work changed
+    // while the receipt was being resolved, CAS fails.
+    return this.locked(() => this.closeLocked(input, receipt));
   }
 
-  private closeLocked(input: CloseWorkInput) {
+  private closeLocked(input: CloseWorkInput, receipt: unknown) {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
     this.recoverPending();
@@ -656,9 +668,8 @@ export class TrajectaStore {
     if (input.status === "complete" && current.openLoops.length) {
       throw new Error(`Cannot close as complete with ${current.openLoops.length} open loop(s); resolve them first`);
     }
-    if (!this.resolveReceipt) throw new Error("Closing work needs a receipt verifier; this store has none configured");
     const now = this.clock();
-    assertWorkCloseReceipt(this.resolveReceipt(input.verificationRef), input, now);
+    assertWorkCloseReceipt(receipt, input, now);
     const next = structuredClone(current);
     next.revision += 1;
     next.status = input.status;

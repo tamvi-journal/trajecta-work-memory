@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { TrajectaStore } from "../../src/store.ts";
-import { withRootWriteLock, LOCK_DIR } from "../../src/lock.ts";
+import { withRootWriteLock, LOCK_DIR, lockStats } from "../../src/lock.ts";
 import { clusterJournal } from "../../src/clusters.ts";
 
 const args = JSON.parse(process.argv[2]);
@@ -26,7 +26,7 @@ try {
         operationId: args.op, workId: args.workId, expectedRevision: args.expectedRevision,
         surface, kind: "progress", summary: `from ${args.name}`,
       });
-      out({ ok: true, revision: result.work.revision });
+      out({ ok: true, revision: result.work.revision, stats: lockStats });
       break;
     }
     case "captures": {
@@ -59,5 +59,5 @@ try {
       throw new Error(`unknown action ${args.action}`);
   }
 } catch (error) {
-  out({ ok: false, error: (error as Error).name, message: (error as Error).message });
+  out({ ok: false, error: (error as Error).name, message: (error as Error).message, stats: lockStats });
 }

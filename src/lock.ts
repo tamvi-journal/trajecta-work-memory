@@ -68,6 +68,16 @@ export class LockInDoubt extends Error {
   }
 }
 
+export class LockConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LockConfigError";
+  }
+}
+
+/** Counters for tests and diagnostics (per process). */
+export const lockStats = { acquired: 0, staleRecovered: 0 };
+
 export class NestedRootLock extends Error {
   constructor(root: string) {
     super(`Nested write lock on ${root}: this mutation already holds it`);
@@ -141,15 +151,35 @@ function recoverStale(root: string, observed: LockOwner, nonce: string, options:
     const quarantine = path.join(root, `${LOCK_DIR}.stale-${nonce}`);
     fs.renameSync(lockDir, quarantine);
     removeDir(quarantine);
+    lockStats.staleRecovered += 1;
     return true;
   } finally {
     removeDir(recoveryDir);
   }
 }
 
-function acquire(root: string, options: LockOptions): LockOwner {
-  const timeoutMs = options.timeoutMs ?? Number(process.env.TRAJECTA_LOCK_TIMEOUT_MS ?? 10_000);
+/**
+ * Bounded retry is an invariant, so bad timing values fail closed instead of
+ * turning into NaN deadlines that never expire.
+ */
+export function lockTiming(options: LockOptions, env: NodeJS.ProcessEnv = process.env) {
+  let timeoutMs = options.timeoutMs;
+  if (timeoutMs === undefined) {
+    const raw = env.TRAJECTA_LOCK_TIMEOUT_MS;
+    timeoutMs = raw === undefined || raw.trim() === "" ? 10_000 : Number(raw);
+    if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new LockConfigError(`TRAJECTA_LOCK_TIMEOUT_MS must be a finite number of milliseconds >= 0, got ${JSON.stringify(raw)}`);
+  } else if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new LockConfigError(`lock timeoutMs must be a finite number >= 0, got ${String(timeoutMs)}`);
+  }
   const retryMs = options.retryMs ?? 15;
+  if (typeof retryMs !== "number" || !Number.isFinite(retryMs) || retryMs <= 0) {
+    throw new LockConfigError(`lock retryMs must be a finite number > 0, got ${String(retryMs)}`);
+  }
+  return { timeoutMs, retryMs };
+}
+
+function acquire(root: string, options: LockOptions): LockOwner {
+  const { timeoutMs, retryMs } = lockTiming(options);
   const hostname = options.hostname ?? os.hostname();
   const isAlive = options.isAlive ?? processAlive;
   const lockDir = path.join(root, LOCK_DIR);
@@ -161,6 +191,7 @@ function acquire(root: string, options: LockOptions): LockOwner {
   for (;;) {
     if (tryMkdir(lockDir)) {
       owner.acquiredAt = new Date().toISOString();
+      lockStats.acquired += 1;
       try {
         writeOwner(lockDir, owner);
       } catch (error) {

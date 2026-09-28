@@ -6,7 +6,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { closeIntentDigest, ReceiptRejected, RevisionConflict, TrajectaStore } from "../src/store.ts";
-import { LOCK_DIR, LockInDoubt, LockTimeout, NestedRootLock, withRootWriteLock } from "../src/lock.ts";
+import { LOCK_DIR, LockConfigError, LockInDoubt, LockTimeout, NestedRootLock, withRootWriteLock } from "../src/lock.ts";
 import { clusterJournal } from "../src/clusters.ts";
 import type { CloseWorkInput, WorkCloseReceipt } from "../src/types.ts";
 
@@ -227,4 +227,98 @@ test("close without a configured verifier is refused", () => {
   const store = new TrajectaStore(root);
   const work = openWork(store, "noverifier");
   assert.throws(() => store.close({ operationId: "operation:c", workId: work.id, expectedRevision: 1, surface: local, status: "complete", summary: "x", verificationRef: "receipt:x", provenance: ["test:x"] }), /verifier/);
+});
+
+test("two processes arriving at one stale lock: exactly one recovers it, nothing is lost", async () => {
+  const root = tmp();
+  const store = new TrajectaStore(root);
+  const work = openWork(store, "dual-recover");
+  assert.equal((await run({ root, action: "hold-and-crash" })).code, 3);
+  const barrier = path.join(root, "go");
+  const runs = [
+    run({ root, action: "capture", name: "r1", op: "operation:r1", workId: work.id, expectedRevision: 1, barrier }),
+    run({ root, action: "capture", name: "r2", op: "operation:r2", workId: work.id, expectedRevision: 1, barrier }),
+  ];
+  setTimeout(() => fs.writeFileSync(barrier, "go"), 400);
+  const results = (await Promise.all(runs)).map((item) => item.result);
+  assert.equal(results.reduce((sum, item) => sum + item.stats.staleRecovered, 0), 1, JSON.stringify(results));
+  assert.equal(results.filter((item) => item.ok).length, 1);
+  assert.equal(results.find((item) => !item.ok).error, "RevisionConflict");
+  assert.equal(store.getWork(work.id).revision, 2);
+  assert.deepEqual(fs.readdirSync(root).filter((name) => name.startsWith(".trajecta-write-lock")), []);
+});
+
+test("journal readers take the lock and never see a half-written append", async () => {
+  const root = tmp();
+  const store = new TrajectaStore(root);
+  const work = openWork(store, "readers");
+  const journal = clusterJournal(root);
+  const writer = run({ root, action: "assigns", name: "w", workId: work.id, count: 60 });
+  let reads = 0;
+  let finished = false;
+  writer.then(() => { finished = true; });
+  while (!finished) {
+    journal.rebuild();
+    journal.events();
+    reads += 1;
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.ok((await writer).result.ok);
+  assert.ok(reads > 0);
+  assert.equal(journal.events().length, 60);
+  assert.ok(journal.verify());
+});
+
+test("lock timing is validated, so a bad value can never mean an endless wait", () => {
+  const root = tmp();
+  const store = new TrajectaStore(root);
+  const work = openWork(store, "timing");
+  fs.mkdirSync(path.join(root, LOCK_DIR));
+  fs.writeFileSync(path.join(root, LOCK_DIR, "owner.json"), JSON.stringify({ schema: "trajecta.write-lock/v1", nonce: "busy", pid: process.pid, hostname: os.hostname(), acquiredAt: new Date().toISOString() }));
+  const previous = process.env.TRAJECTA_LOCK_TIMEOUT_MS;
+  process.env.TRAJECTA_LOCK_TIMEOUT_MS = "wat";
+  try {
+    const started = Date.now();
+    assert.throws(() => store.capture({ operationId: "operation:t1", workId: work.id, expectedRevision: 1, surface: local, kind: "progress", summary: "x" }), LockConfigError);
+    assert.ok(Date.now() - started < 1_000, "fails at once instead of hanging under contention");
+  } finally {
+    if (previous === undefined) delete process.env.TRAJECTA_LOCK_TIMEOUT_MS; else process.env.TRAJECTA_LOCK_TIMEOUT_MS = previous;
+  }
+  for (const lock of [{ timeoutMs: Number.NaN }, { timeoutMs: -1 }, { timeoutMs: 100, retryMs: 0 }, { timeoutMs: 100, retryMs: Number.POSITIVE_INFINITY }]) {
+    const bad = new TrajectaStore(root, undefined, undefined, { lock });
+    assert.throws(() => bad.capture({ operationId: "operation:t2", workId: work.id, expectedRevision: 1, surface: local, kind: "progress", summary: "x" }), LockConfigError, JSON.stringify(lock));
+  }
+  const bounded = new TrajectaStore(root, undefined, undefined, { lock: { timeoutMs: 200 } });
+  assert.throws(() => bounded.capture({ operationId: "operation:t3", workId: work.id, expectedRevision: 1, surface: local, kind: "progress", summary: "x" }), LockTimeout);
+});
+
+test("close resolves its receipt outside the root lock", () => {
+  const root = tmp();
+  const receipts = new Map<string, unknown>();
+  let store: TrajectaStore;
+  let mutateDuringResolve = false;
+  store = new TrajectaStore(root, undefined, undefined, {
+    resolveReceipt: (ref) => {
+      // A verifier that reads and writes Trajecta itself would dead-lock or
+      // hit NestedRootLock if it ran inside the lock.
+      store.list();
+      clusterJournal(root).append(`operation:verifier-${ref.replace(":", "-")}-${mutateDuringResolve}`, { ref, mutateDuringResolve }, () => ({ type: "assign" as const, workId: workId, cluster: "verified", reason: "checked", surface: local }));
+      if (mutateDuringResolve) {
+        const current = store.getWork(workId);
+        store.capture({ operationId: "operation:sneak", workId, expectedRevision: current.revision, surface: local, kind: "progress", summary: "changed meanwhile" });
+      }
+      return receipts.get(ref);
+    },
+  });
+  const workId = openWork(store, "outside").id;
+  const input = { workId, expectedRevision: 1, status: "complete" as const, summary: "Done", verificationRef: "receipt:o1", provenance: ["test:ok"] };
+  receipts.set("receipt:o1", receiptFor(input));
+  mutateDuringResolve = true;
+  assert.throws(() => store.close({ ...input, operationId: "operation:close-raced", surface: local }), RevisionConflict, "work changed while the receipt was resolved");
+  mutateDuringResolve = false;
+  const current = store.getWork(workId);
+  const next = { ...input, expectedRevision: current.revision };
+  receipts.set("receipt:o1", receiptFor(next));
+  const closed = store.close({ ...next, operationId: "operation:close-ok", surface: local });
+  assert.equal(closed.work.status, "complete");
 });

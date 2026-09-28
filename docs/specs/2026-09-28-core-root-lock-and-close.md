@@ -15,7 +15,9 @@ Two MCP servers pointing at one root (the Aux ↔ Lam exchange) can both read re
 - **Stale recovery** only when same hostname AND the owner pid is dead: rename the canonical lock to a quarantine name containing the recoverer's nonce, and delete only a quarantine this process renamed itself. Different hostname → no automatic recovery; report the owner.
 - **One boundary, no nesting:** `withRootWriteLock(root, mutation)`. After acquiring: replay → recover → re-read state/projection → CAS → mutate → commit. Internal helpers never acquire again; a nested acquire on the same root is rejected deterministically (no deadlock).
 - The lock covers every `TrajectaStore` and `DomainJournal` mutation, including recovery/reconcile.
-- Plain reads of `state.json` / projections stay lock-free (atomic replace). Anything comparing journal ↔ projection (verify, rebuild, audit) takes the lock or uses explicit snapshot semantics.
+- Plain reads of `state.json` / projections stay lock-free (atomic replace). Journal reads that must see whole records — `DomainJournal.events()`, `rebuild()`, `verify()` — take the lock; their `*Locked` variants are used inside mutations so nothing nests.
+- Lock timing is validated before acquiring: `timeoutMs` finite and >= 0, `retryMs` finite and > 0, `TRAJECTA_LOCK_TIMEOUT_MS` must parse. Anything else is `LockConfigError`, never a NaN deadline that waits forever.
+- Known, accepted: PID reuse can make a dead owner look alive; the result is a `LockTimeout`, never a removed lock (availability over corruption).
 
 ## 2. `store.close`
 
@@ -29,6 +31,7 @@ status: "complete" | "abandoned"
 - Receipt purpose `work_close`, bound to: exact workId, expectedRevision, terminal status, digest of the close intent (summary, provenance, status), authority/evidence class, outcome, issuedAt (and expiresAt if it has a lifetime).
 - `complete` = evidence-backed verification. `abandoned` = explicit authorised abandonment, never presented as a verified success.
 - Same resolver machinery as incident promotion, different typed semantics: a `work_close` receipt cannot promote an invariant and an `incident_promotion` receipt cannot close work.
+- **Receipt resolution happens outside the root lock** (Lam's review of #6): (1) locked replay — a committed close returns without calling the verifier; (2) unlocked `resolveReceipt(ref)` — the verifier may do slow I/O or read/write Trajecta itself; (3) locked replay → recover → re-read → CAS → validate the receipt against the exact request and the current time → commit. If the work changed while the receipt was resolved, CAS fails.
 - Terminal consistency: after close `nextAction = null`; `complete` with unresolved open loops **fails** (caller resolves them explicitly; never silently cleared); `abandoned` may keep open loops as a record of what was dropped; terminal work accepts no further capture/resume.
 
 ## 3. Compatibility
@@ -55,3 +58,7 @@ Real child processes, all three OS:
 6. crash after mkdir before owner.json → `LockInDoubt`, lock not removed
 7. nested acquire on the same root → rejected deterministically, no deadlock
 8. close: complete with open loops fails; abandoned keeps loops; terminal rejects capture/resume; receipt purpose mismatch rejected
+9. two processes at one stale lock → exactly one recovery (counted), one CAS winner, no lock/quarantine leftovers
+10. journal readers during a concurrent writer never see a half-written record
+11. invalid lock timing (env `wat`, NaN, negative, zero/infinite retry) fails at once under contention
+12. a verifier that reads and writes the same root works; a verifier racing a capture makes close fail CAS
