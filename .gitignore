@@ -6,3 +6,4 @@ coverage/
 *.sqlite*
 .env*
 !.env.example
+.trajecta-write-lock/

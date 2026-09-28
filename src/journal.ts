@@ -20,6 +20,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { appendJsonl, canonicalStoreDigest, OperationConflict, OperationInDoubt, writeAtomic } from "./store.ts";
+import { withRootWriteLock, type LockOptions } from "./lock.ts";
 
 export type JournalFaultPoint = "after-reserve" | "after-journal" | "after-projection";
 
@@ -105,7 +106,10 @@ export class DomainJournal<P, E extends JournalEvent> {
   private readonly clock: () => Date;
   private readonly fault?: (point: JournalFaultPoint) => void;
 
-  constructor(root: string, spec: DomainSpec<P, E>, clock: () => Date = () => new Date(), fault?: (point: JournalFaultPoint) => void) {
+  private readonly lockOptions: LockOptions;
+
+  constructor(root: string, spec: DomainSpec<P, E>, clock: () => Date = () => new Date(), fault?: (point: JournalFaultPoint) => void, lockOptions: LockOptions = {}) {
+    this.lockOptions = lockOptions;
     this.root = root;
     this.spec = spec;
     this.journalFile = path.join(root, `${spec.name}.jsonl`);
@@ -147,7 +151,12 @@ export class DomainJournal<P, E extends JournalEvent> {
     return this.events().reduce((projection, event) => this.spec.apply(projection, event), this.spec.empty());
   }
 
+  /** Journal and projection agree. Takes the root lock so no writer is mid-commit. */
   verify() {
+    return withRootWriteLock(this.root, () => this.verifyLocked(), this.lockOptions);
+  }
+
+  private verifyLocked() {
     const stored = this.readProjectionFile();
     const events = this.events();
     return stored.events === events.length && canonicalStoreDigest(stored.value) === canonicalStoreDigest(this.rebuild());
@@ -160,6 +169,10 @@ export class DomainJournal<P, E extends JournalEvent> {
    */
   append(operationId: string, input: unknown, build: (projection: P, now: string) => Omit<E, keyof JournalEvent>): { event: E; projection: P; replayed: boolean } {
     assertOperationId(operationId);
+    return withRootWriteLock(this.root, () => this.appendLocked(operationId, input, build), this.lockOptions);
+  }
+
+  private appendLocked(operationId: string, input: unknown, build: (projection: P, now: string) => Omit<E, keyof JournalEvent>): { event: E; projection: P; replayed: boolean } {
     const replayed = this.replay(operationId, input);
     if (replayed) return { ...replayed, replayed: true };
     this.recoverPending();

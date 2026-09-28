@@ -1,14 +1,17 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { withRootWriteLock, type LockOptions } from "./lock.ts";
 import type {
   Branch,
+  CloseWorkInput,
   CaptureDeltaInput,
   Delta,
   OpenWorkInput,
   RouteMatch,
   Surface,
   TransferPacket,
+  WorkCloseReceipt,
   WorkItem,
 } from "./types.ts";
 
@@ -166,7 +169,7 @@ function isDelta(value: unknown): value is Delta {
     && typeof delta.operationId === "string"
     && typeof delta.workId === "string"
     && Number.isInteger(delta.revision) && delta.revision > 0
-    && ["instruction", "decision", "progress", "blocker", "correction", "next_action", "branch_open", "branch_park", "synthesis", "handoff", "outcome", "contract_anchor", "open", "resume"].includes(delta.kind as string)
+    && ["instruction", "decision", "progress", "blocker", "correction", "next_action", "branch_open", "branch_park", "synthesis", "handoff", "outcome", "contract_anchor", "open", "resume", "close"].includes(delta.kind as string)
     && typeof delta.summary === "string"
     && isSurface(delta.surface)
     && (typeof delta.branchId === "string" || delta.branchId === null)
@@ -288,6 +291,44 @@ export function writeAtomic(file: string, value: unknown) {
   syncDirectory(path.dirname(file));
 }
 
+/** Digest of a close request, which a work-close receipt must carry. */
+export function closeIntentDigest(input: Pick<CloseWorkInput, "workId" | "expectedRevision" | "status" | "summary" | "provenance">) {
+  return canonicalStoreDigest({
+    workId: input.workId,
+    expectedRevision: input.expectedRevision,
+    status: input.status,
+    summary: input.summary.trim(),
+    provenance: [...input.provenance],
+  });
+}
+
+export class ReceiptRejected extends Error {
+  constructor(reason: string) {
+    super(`Close receipt rejected: ${reason}`);
+    this.name = "ReceiptRejected";
+  }
+}
+
+function assertWorkCloseReceipt(value: unknown, input: CloseWorkInput, now: Date) {
+  const receipt = value as Partial<WorkCloseReceipt> | null | undefined;
+  if (!receipt) throw new ReceiptRejected("no receipt found for this reference");
+  if (receipt.purpose !== "work_close") throw new ReceiptRejected(`purpose ${String(receipt.purpose)} cannot close work`);
+  if (receipt.schema !== "trajecta.work-close-receipt/v1") throw new ReceiptRejected("unsupported schema");
+  if (receipt.id !== input.verificationRef) throw new ReceiptRejected("receipt id does not match the reference");
+  if (receipt.workId !== input.workId) throw new ReceiptRejected("receipt is for a different work item");
+  if (receipt.expectedRevision !== input.expectedRevision) throw new ReceiptRejected("receipt is for a different revision");
+  if (receipt.status !== input.status) throw new ReceiptRejected("receipt is for a different terminal status");
+  if (receipt.intentDigest !== closeIntentDigest(input)) throw new ReceiptRejected("receipt does not match this close request");
+  if (receipt.outcome !== "approved") throw new ReceiptRejected("receipt is not an approval");
+  if (typeof receipt.authority !== "string" || !receipt.authority.trim()) throw new ReceiptRejected("receipt names no authority");
+  if (input.status === "complete" && (typeof receipt.evidenceClass !== "string" || !receipt.evidenceClass.trim())) {
+    throw new ReceiptRejected("closing as complete needs an evidence class");
+  }
+  const issued = Date.parse(String(receipt.issuedAt));
+  if (!Number.isFinite(issued) || issued > now.getTime()) throw new ReceiptRejected("receipt issue time is invalid or in the future");
+  if (receipt.expiresAt !== undefined && !(Date.parse(receipt.expiresAt) > now.getTime())) throw new ReceiptRejected("receipt has expired");
+}
+
 export class TrajectaStore {
   readonly root: string;
   private readonly stateFile: string;
@@ -296,13 +337,43 @@ export class TrajectaStore {
   private readonly clock: () => Date;
   private readonly fault?: (point: StoreFaultPoint) => void;
 
-  constructor(root = path.resolve(".trajecta"), clock: () => Date = () => new Date(), fault?: (point: StoreFaultPoint) => void) {
+  private readonly lockOptions: LockOptions;
+  private readonly resolveReceipt?: (reference: string) => unknown;
+
+  constructor(
+    root = path.resolve(".trajecta"),
+    clock: () => Date = () => new Date(),
+    fault?: (point: StoreFaultPoint) => void,
+    options: { lock?: LockOptions; resolveReceipt?: (reference: string) => unknown } = {},
+  ) {
     this.root = root;
     this.stateFile = path.join(root, "state.json");
     this.deltaFile = path.join(root, "deltas.jsonl");
     this.operationFile = path.join(root, "operations.jsonl");
     this.clock = clock;
     this.fault = fault;
+    this.lockOptions = options.lock ?? {};
+    this.resolveReceipt = options.resolveReceipt;
+  }
+
+  /** Run one mutation under the root write lock (see lock.ts). */
+  private locked<T>(mutation: () => T): T {
+    return withRootWriteLock(this.root, mutation, this.lockOptions);
+  }
+
+  /**
+   * Finish every operation that was reserved but never committed, before a
+   * new mutation builds on the state. Runs under the root lock.
+   */
+  private recoverPending() {
+    const records = readJsonl<OperationRecord>(this.operationFile, "operations");
+    const committed = new Set(records.filter((record) => record.state === "committed").map((record) => record.operationId));
+    for (const record of records) {
+      if (record.state === "reserved" && "schema" in record && !committed.has(record.operationId)) {
+        this.reconcileReservation(record);
+        committed.add(record.operationId);
+      }
+    }
   }
 
   private readState(): StateFile {
@@ -387,8 +458,13 @@ export class TrajectaStore {
   }
 
   open(input: OpenWorkInput) {
+    return this.locked(() => this.openLocked(input));
+  }
+
+  private openLocked(input: OpenWorkInput) {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
+    this.recoverPending();
     assertText(input.topic, "Topic", 160);
     assertText(input.goal, "Goal", 1_000);
     if (input.instruction) assertText(input.instruction, "Instruction", 1_000);
@@ -431,8 +507,13 @@ export class TrajectaStore {
   }
 
   capture(input: CaptureDeltaInput) {
+    return this.locked(() => this.captureLocked(input));
+  }
+
+  private captureLocked(input: CaptureDeltaInput) {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
+    this.recoverPending();
     assertText(input.summary, "Delta summary", input.kind === "contract_anchor" ? 8_000 : 1_000);
     assertSurface(input.surface);
     const state = this.readState();
@@ -501,8 +582,13 @@ export class TrajectaStore {
   }
 
   resume(input: { operationId: string; workId: string; expectedRevision: number; surface: Surface; instruction?: string }) {
+    return this.locked(() => this.resumeLocked(input));
+  }
+
+  private resumeLocked(input: { operationId: string; workId: string; expectedRevision: number; surface: Surface; instruction?: string }) {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
+    this.recoverPending();
     assertSurface(input.surface);
     const state = this.readState();
     const beforeState = structuredClone(state);
@@ -530,6 +616,67 @@ export class TrajectaStore {
       targetSurface: null,
       provenance: [],
       createdAt: now,
+    };
+    state.work[index] = next;
+    return this.commit(beforeState, state, delta, input);
+  }
+
+  /**
+   * Close a work item as complete or abandoned (see
+   * docs/specs/2026-09-28-core-root-lock-and-close.md §2).
+   *
+   * The receipt is resolved by reference through the verifier the store was
+   * built with and must bind this exact close: work id, expected revision,
+   * status and the digest of summary/provenance/status. `complete` refuses
+   * work that still has open loops; `abandoned` keeps them as a record of
+   * what was dropped. After close the next action is cleared and the work
+   * accepts no further capture or resume.
+   */
+  close(input: CloseWorkInput) {
+    return this.locked(() => this.closeLocked(input));
+  }
+
+  private closeLocked(input: CloseWorkInput) {
+    const replay = this.replay(input.operationId, input);
+    if (replay) return replay;
+    this.recoverPending();
+    if (input.status !== "complete" && input.status !== "abandoned") throw new Error("Close status must be complete or abandoned");
+    assertText(input.summary, "Close summary", 1_000);
+    assertText(input.verificationRef, "Verification reference", 200);
+    assertSurface(input.surface);
+    if (!Array.isArray(input.provenance) || input.provenance.some((item) => typeof item !== "string")) throw new Error("Close provenance must be a list of references");
+    if (input.status === "complete" && !input.provenance.length) throw new Error("Closing as complete requires provenance");
+    const state = this.readState();
+    const beforeState = structuredClone(state);
+    const index = state.work.findIndex((item) => item.id === input.workId);
+    if (index < 0) throw new Error("Work item not found");
+    const current = state.work[index];
+    if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
+    if (["complete", "abandoned"].includes(current.status)) throw new Error("Work is already closed");
+    if (input.status === "complete" && current.openLoops.length) {
+      throw new Error(`Cannot close as complete with ${current.openLoops.length} open loop(s); resolve them first`);
+    }
+    if (!this.resolveReceipt) throw new Error("Closing work needs a receipt verifier; this store has none configured");
+    const now = this.clock();
+    assertWorkCloseReceipt(this.resolveReceipt(input.verificationRef), input, now);
+    const next = structuredClone(current);
+    next.revision += 1;
+    next.status = input.status;
+    next.nextAction = null;
+    next.lastSurface = structuredClone(input.surface);
+    next.updatedAt = now.toISOString();
+    const delta: Delta = {
+      id: `delta:${crypto.randomUUID()}`,
+      operationId: input.operationId,
+      workId: input.workId,
+      revision: next.revision,
+      kind: "close",
+      summary: input.summary.trim(),
+      surface: structuredClone(input.surface),
+      branchId: next.activeBranchId,
+      targetSurface: null,
+      provenance: [...input.provenance, input.verificationRef],
+      createdAt: now.toISOString(),
     };
     state.work[index] = next;
     return this.commit(beforeState, state, delta, input);

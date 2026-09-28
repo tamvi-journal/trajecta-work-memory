@@ -261,6 +261,10 @@ A stale client MUST be rejected with enough information to reconcile. It MUST NO
 
 `trajectad` is the normal single-writer authority. Product clients do not each invent their own lock semantics.
 
+### Root write lock (core, 2026-09-28)
+
+Until `trajectad` exists, and underneath it afterwards, the core serialises every store and domain-journal mutation on a root with one cross-process lock (`<root>/.trajecta-write-lock/`, atomic `mkdir`, owner nonce/pid/hostname). CAS is checked after the lock is held, so two writers at the same revision produce one success and one `RevisionConflict`, never a lost write. An ownerless lock is `LockInDoubt` and is never removed automatically; a stale lock is recovered only on the same host with a dead owner pid. See `docs/specs/2026-09-28-core-root-lock-and-close.md`.
+
 ---
 
 ## 7. Durable storage contract
@@ -272,6 +276,10 @@ The logical storage model is cross-platform and replayable.
 Material work history remains append-oriented and inspectable.
 
 A delta MUST contain enough information for deterministic replay of the fields it changes.
+
+#### Delta-log compatibility (2026-09-28)
+
+Delta kind `close` (terminal `complete` / `abandoned`, bound to a typed `work_close` receipt) was added to the delta log. State schema backward compatibility is preserved (`state.json` stays `trajecta.state/v1`); **historical delta-log readers prior to close support are not forward-compatible** and reject a log that contains a `close` delta. This is a declared delta-log capability bump, not a silent one.
 
 ### 7.2 Snapshotting
 
