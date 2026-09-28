@@ -143,15 +143,36 @@ function retrying<T>(action: () => T, attempts = 40): T {
   }
 }
 
-function removeDir(dir: string) {
-  retrying(() => {
-    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 5 });
-    if (fs.existsSync(dir)) {
-      const error = new Error(`Could not remove ${dir}`) as NodeJS.ErrnoException;
-      error.code = "ENOTEMPTY";
-      throw error;
-    }
-  });
+/** Remove a directory whose name no other process will ever reuse. */
+function removeUnique(dir: string) {
+  try {
+    retrying(() => {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 5 });
+      if (fs.existsSync(dir)) {
+        const error = new Error(`Could not remove ${dir}`) as NodeJS.ErrnoException;
+        error.code = "ENOTEMPTY";
+        throw error;
+      }
+    });
+  } catch {
+    // A leftover uniquely named directory is harmless garbage, never a lock.
+  }
+}
+
+/**
+ * Give up a shared name (the lock or the recovery mutex). The directory is
+ * first renamed to a name only this process uses, so removal can never
+ * touch a lock another process has just created under the shared name.
+ */
+function retire(dir: string, nonce: string) {
+  const unique = `${dir}.gone-${nonce}-${crypto.randomUUID().slice(0, 8)}`;
+  try {
+    retrying(() => fs.renameSync(dir, unique));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  removeUnique(unique);
 }
 
 function tryMkdir(dir: string) {
@@ -173,18 +194,18 @@ function recoverStale(root: string, observed: LockOwner, nonce: string, options:
     const current = readOwner(lockDir);
     // Only the exact dead owner we observed may be removed.
     if (!current || current.nonce !== observed.nonce || current.hostname !== options.hostname || options.isAlive(current.pid)) return false;
-    const quarantine = path.join(root, `${LOCK_DIR}.stale-${nonce}`);
+    const quarantine = path.join(root, `${LOCK_DIR}.stale-${nonce}-${crypto.randomUUID().slice(0, 8)}`);
     try {
       retrying(() => fs.renameSync(lockDir, quarantine));
     } catch (error) {
       if (TRANSIENT.has((error as NodeJS.ErrnoException).code ?? "")) return false; // try again on the next round
       throw error;
     }
-    removeDir(quarantine);
+    removeUnique(quarantine);
     lockStats.staleRecovered += 1;
     return true;
   } finally {
-    removeDir(recoveryDir);
+    retire(recoveryDir, nonce);
   }
 }
 
@@ -225,7 +246,7 @@ function acquire(root: string, options: LockOptions): LockOwner {
       try {
         writeOwner(lockDir, owner);
       } catch (error) {
-        removeDir(lockDir);
+        retire(lockDir, owner.nonce);
         throw error;
       }
       return owner;
@@ -253,7 +274,7 @@ function release(root: string, owner: LockOwner) {
   if (!current || current.nonce !== owner.nonce) {
     throw new LockInDoubt(`Write lock ${lockDir} changed owner while it was held`);
   }
-  removeDir(lockDir);
+  retire(lockDir, owner.nonce);
 }
 
 export function withRootWriteLock<T>(root: string, mutation: () => T, options: LockOptions = {}): T {
