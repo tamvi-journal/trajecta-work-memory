@@ -13,7 +13,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
-import { type ClusterAssignment, type ClusterIndex, type CueRegistry, validateRegistry } from "./clusters.ts";
+import { clusterOf, type ClusterAssignment, type ClusterIndex, type CueRegistry, validateRegistry } from "./clusters.ts";
 import type { Surface } from "./types.ts";
 
 export const PROFILE_FILE = "profile.json";
@@ -177,7 +177,8 @@ export function bootstrap(
   const now = capabilities.now();
   const key = surfaceKey(input.surface);
   const digest = canonicalStoreDigest({ evidence, entrypoints: profile.canonicalEntrypoints });
-  const current = capabilities.read().latest[key];
+  const latest = capabilities.read().latest;
+  const current = Object.hasOwn(latest, key) ? latest[key] : undefined;
   const fresh = current && current.evidenceDigest === digest && Date.parse(current.expiresAt) > now.getTime();
   const snapshot = fresh ? current : capabilities.append(input.operationId, { surface: input.surface, evidence, profile: profile.name }, (_index, recordedAt) => ({
     surfaceKey: key,
@@ -189,7 +190,7 @@ export function bootstrap(
     unknowns: evidence.unknowns,
     gotchas: evidence.gotchas,
   })).event;
-  const byWork = clusters?.read().byWork ?? {};
+  const index = clusters?.read() ?? { byWork: {}, members: {} };
   const activeWork = store.list()
     .filter((item) => !["complete", "abandoned"].includes(item.status))
     .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
@@ -199,7 +200,7 @@ export function bootstrap(
       topic: item.topic,
       status: item.status,
       revision: item.revision,
-      cluster: byWork[item.id]?.cluster ?? null,
+      cluster: clusterOf(index, item.id),
       next_action: item.nextAction,
       open_loops: item.openLoops.length,
       updated_at: item.updatedAt,

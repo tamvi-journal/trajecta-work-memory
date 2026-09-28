@@ -11,7 +11,7 @@ import path from "node:path";
 import { RevisionConflict, TrajectaStore } from "./store.ts";
 import { TrajectaRelay } from "./relay.ts";
 import { bootstrap, CAPABILITY_SNAPSHOTS, loadProfile, type WorkProfile } from "./boot.ts";
-import { CLUSTER_ID, clusterJournal, routeClusters } from "./clusters.ts";
+import { CLUSTER_ID, clusterJournal, hasCluster, routeClusters } from "./clusters.ts";
 import { workContext, type ContextMode } from "./context.ts";
 import { DomainJournal } from "./journal.ts";
 import { assertSafe, UnsafeInput } from "./safety.ts";
@@ -185,7 +185,7 @@ export class WorkServer {
         s.getWork(workId);
         if (!CLUSTER_ID.test(cluster)) throw new Error("Invalid cluster id");
         const registry = this.profile.cueRegistry;
-        if (registry && !(cluster in registry.clusters)) throw new Error(`Unknown cluster ${cluster}; known: ${Object.keys(registry.clusters).join(", ")}`);
+        if (registry && !hasCluster(registry, cluster)) throw new Error(`Unknown cluster ${cluster}; known: ${Object.keys(registry.clusters).join(", ")}`);
         const result = this.clusters.append(this.op(args), { workId, cluster, reason: String(args.reason) }, () => ({
           type: "assign" as const, workId, cluster, reason: String(args.reason), surface: this.surface,
         }));

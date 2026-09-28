@@ -12,7 +12,7 @@
  */
 import type { TrajectaStore } from "./store.ts";
 import type { DomainJournal } from "./journal.ts";
-import type { ClusterAssignment, ClusterIndex } from "./clusters.ts";
+import { clusterOf, membersOf, type ClusterAssignment, type ClusterIndex } from "./clusters.ts";
 import type { Delta } from "./types.ts";
 
 export type ContextMode = "normal" | "debug" | "audit";
@@ -57,7 +57,7 @@ export function workContext(
 
   if (!input.workId) {
     if (!input.cluster) throw new Error("Give a work_id, or a cluster to list");
-    const members = new Set(index.members[input.cluster] ?? []);
+    const members = new Set(membersOf(index, input.cluster));
     const work = store.list()
       .filter((item) => members.has(item.id) && (input.mode === "audit" || !["complete", "abandoned"].includes(item.status)))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
@@ -95,7 +95,7 @@ export function workContext(
       instruction: item.instruction,
       status: item.status,
       revision: item.revision,
-      cluster: index.byWork[item.id]?.cluster ?? null,
+      cluster: clusterOf(index, item.id),
       open_loops: item.openLoops,
       next_action: item.nextAction,
       last_surface: item.lastSurface,

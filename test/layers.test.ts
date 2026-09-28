@@ -106,6 +106,30 @@ test("legacy AWM/LWM cue registry parses and routes deterministically", () => {
   assert.equal(routeClusters(registry, "docs site and memory system", ["memory-system"]).selected[0].cluster, "memory-system");
 });
 
+test("any primary hit outranks alias-only hits, and inherited names are safe", () => {
+  const registry = validateRegistry({
+    schema: "trajecta.cue-registry/v1",
+    maxClusters: 1,
+    clusters: {
+      primary: { primary: ["deploy"] },
+      aliases: { primary: ["unrelated"], aliases: ["release", "ship", "rollout"] },
+      constructor: { primary: ["build"] },
+    },
+  });
+  assert.equal(routeClusters(registry, "deploy the release and ship the rollout").selected[0].cluster, "primary");
+  assert.equal(routeClusters(registry, "build it").selected[0].cluster, "constructor");
+  const root = tmp();
+  const store = new TrajectaStore(root, clock);
+  const work = openWork(store, "Proto");
+  const journal = clusterJournal(root, clock);
+  assign(journal, "operation:proto-1", work.id, "constructor");
+  assign(journal, "operation:proto-2", work.id, "tostring");
+  assert.deepEqual(journal.read().members, { tostring: [work.id] });
+  assert.ok(journal.verify());
+  assert.equal(workContext(store, journal, { cluster: "constructor", mode: "normal" }).work.length, 0);
+  assert.equal(workContext(store, journal, { cluster: "hasownproperty", mode: "normal" }).work.length, 0);
+});
+
 test("cue registry validation rejects bad ids and empty clusters", () => {
   assert.throws(() => validateRegistry({ schema: "trajecta.cue-registry/v1", clusters: { "Bad ID": { primary: ["x"] } } }), /Invalid cluster id/);
   assert.throws(() => validateRegistry({ schema: "trajecta.cue-registry/v1", clusters: { ok: { detail: ["x"] } } }), /needs a primary/);
@@ -189,6 +213,7 @@ test("import-awm reproduces tasks, loops, next actions and clusters, and is idem
   assert.equal(fs.readFileSync(path.join(SOURCE, "state", "lifecycle-events.jsonl"), "utf8"), before, "source untouched");
   assert.equal(report.tasks.length, 3);
   for (const task of report.tasks) assert.deepEqual(task.matches, { openLoops: true, nextAction: true, goal: true }, task.sourceTaskId);
+  assert.equal(store.list().length, 2, "only open source tasks become work items");
   const main = report.tasks.find((task) => task.sourceTaskId === "task:11111111-aaaa")!;
   assert.equal(main.revision, 10, "one delta per source event");
   assert.equal(main.revision, main.sourceRevision, "a task whose state lives in its events keeps its revision");
@@ -203,14 +228,18 @@ test("import-awm reproduces tasks, loops, next actions and clusters, and is idem
   assert.ok(history.every((delta) => delta.kind === "open" || delta.kind === "resume" || delta.provenance.some((ref) => ref.startsWith("source:awm:"))));
   const closed = report.tasks.find((task) => task.sourceTaskId === "task:33333333-cccc")!;
   assert.equal(closed.closedInSource, true);
+  assert.equal(closed.archived, true, "a completed source task is archived, not opened");
+  assert.equal(closed.workId, null);
+  const archive = JSON.parse(fs.readFileSync(path.join(root, "archive-index.json"), "utf8"));
+  assert.equal(archive.value.bySource["awm:task:33333333-cccc"].status, "complete");
   const clusters = clusterJournal(root, clock).read();
   assert.equal(clusters.byWork[main.workId].cluster, "memory-system");
   assert.equal(clusters.byWork[report.tasks[1].workId].cluster, "docs-site");
 
   const again = importLifecycle(store, SOURCE, "awm");
   assert.deepEqual(again.tasks.map((task) => [task.workId, task.revision]), report.tasks.map((task) => [task.workId, task.revision]));
-  assert.equal(store.list().length, 3);
-  assert.equal(clusterJournal(root, clock).events().length, 3);
+  assert.equal(store.list().length, 2);
+  assert.equal(clusterJournal(root, clock).events().length, 2);
 });
 
 // --- MCP ------------------------------------------------------------------------

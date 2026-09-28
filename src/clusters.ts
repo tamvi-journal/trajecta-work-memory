@@ -116,14 +116,24 @@ export function routeClusters(registry: CueRegistry, message: string, activeClus
     const hit = primary.length > 0 || aliases.length > 0;
     const detail = hit ? cues.detail.filter((cue) => containsPhrase(text, cue)) : [];
     const active = activeClusters.includes(cluster);
-    const score = hit ? primary.length * 100 + aliases.length * 50 + detail.length * 10 + (active ? 1 : 0) : 0;
+    // Lists hold at most 64 cues, so each class weight dominates every lower
+    // class: any primary hit outranks any number of alias-only hits.
+    const score = hit ? primary.length * 10_000 + aliases.length * 100 + detail.length : 0;
     return { cluster, score, matches: { primary, aliases, detail }, active };
   });
+  const rank = (left: ClusterRoute, right: ClusterRoute) =>
+    right.matches.primary.length - left.matches.primary.length
+    || right.matches.aliases.length - left.matches.aliases.length
+    || right.matches.detail.length - left.matches.detail.length;
   const selected = considered
     .filter((item) => item.score > 0)
-    .sort((left, right) => right.score - left.score || left.cluster.localeCompare(right.cluster))
+    .sort((left, right) => rank(left, right) || Number(right.active) - Number(left.active) || left.cluster.localeCompare(right.cluster))
     .slice(0, registry.maxClusters);
-  return { normalized: text, selected, ambiguous: selected.length > 1 && selected[0].score === selected[1].score };
+  return {
+    normalized: text,
+    selected,
+    ambiguous: selected.length > 1 && rank(selected[0], selected[1]) === 0 && selected[0].active === selected[1].active,
+  };
 }
 
 // --- membership journal ---------------------------------------------------
@@ -139,6 +149,23 @@ export interface ClusterAssignment extends JournalEvent {
 export interface ClusterIndex {
   byWork: Record<string, { cluster: string; assignedAt: string; eventId: string }>;
   members: Record<string, string[]>;
+}
+
+/** Own-property read, so ids like `constructor` never hit Object.prototype. */
+export function own<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+export function membersOf(index: ClusterIndex, cluster: string): string[] {
+  return own(index.members, cluster) ?? [];
+}
+
+export function clusterOf(index: ClusterIndex, workId: string): string | null {
+  return own(index.byWork, workId)?.cluster ?? null;
+}
+
+export function hasCluster(registry: CueRegistry, cluster: string) {
+  return Object.hasOwn(registry.clusters, cluster);
 }
 
 function isAssignment(value: unknown): value is ClusterAssignment {
@@ -160,11 +187,14 @@ export const CLUSTER_MEMBERSHIP: DomainSpec<ClusterIndex, ClusterAssignment> = {
   projectionSchema: "trajecta.cluster-index/v1",
   empty: () => ({ byWork: {}, members: {} }),
   apply(index, event) {
-    const previous = index.byWork[event.workId]?.cluster;
-    if (previous) index.members[previous] = (index.members[previous] ?? []).filter((id) => id !== event.workId);
-    if (previous && !index.members[previous].length) delete index.members[previous];
+    const previous = own(index.byWork, event.workId)?.cluster;
+    if (previous) {
+      const rest = membersOf(index, previous).filter((id) => id !== event.workId);
+      if (rest.length) index.members[previous] = rest;
+      else delete index.members[previous];
+    }
     index.byWork[event.workId] = { cluster: event.cluster, assignedAt: event.recordedAt, eventId: event.id };
-    index.members[event.cluster] = [...(index.members[event.cluster] ?? []).filter((id) => id !== event.workId), event.workId];
+    index.members[event.cluster] = [...membersOf(index, event.cluster).filter((id) => id !== event.workId), event.workId];
     return index;
   },
   isEvent: isAssignment,

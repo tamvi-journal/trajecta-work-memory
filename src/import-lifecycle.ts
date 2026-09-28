@@ -17,9 +17,42 @@ import fs from "node:fs";
 import path from "node:path";
 import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
 import { clusterJournal, parseLegacyCueRegistry, type CueRegistry } from "./clusters.ts";
+import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
 import type { BranchInput, CaptureDeltaInput, DeltaKind, Surface, WorkItem } from "./types.ts";
 
 export type LifecycleSource = "awm" | "lwm";
+
+/**
+ * Tasks the source already closed (status complete/abandoned) are not turned
+ * into live work items: Trajecta has no verified close yet, and a live item
+ * would show up as open work and could be resumed. Their bounded history is
+ * kept in the `archived-work` journal instead, until verified close lands.
+ */
+export interface ArchivedTask extends JournalEvent {
+  source: LifecycleSource;
+  sourceTaskId: string;
+  cluster: string;
+  status: string;
+  goal: string;
+  events: Array<{ eventId: string; kind: string; revision: number; summary: string; provenance: string[]; recordedAt: string }>;
+}
+
+export const ARCHIVED_WORK: DomainSpec<{ bySource: Record<string, { status: string; cluster: string; eventId: string }> }, ArchivedTask> = {
+  name: "archived-work",
+  projectionFile: "archive-index.json",
+  projectionSchema: "trajecta.archive-index/v1",
+  empty: () => ({ bySource: {} }),
+  apply(index, event) {
+    index.bySource[`${event.source}:${event.sourceTaskId}`] = { status: event.status, cluster: event.cluster, eventId: event.id };
+    return index;
+  },
+  isEvent: (value: unknown): value is ArchivedTask => {
+    const event = value as Partial<ArchivedTask> | null;
+    return Boolean(event) && typeof event!.id === "string" && typeof event!.sourceTaskId === "string" && Array.isArray(event!.events);
+  },
+};
+
+const TERMINAL = new Set(["complete", "abandoned"]);
 
 interface SourceBranch {
   branch_id: string;
@@ -91,7 +124,8 @@ export interface ImportReport {
   sourceDigest: string;
   tasks: Array<{
     sourceTaskId: string;
-    workId: string;
+    workId: string | null;
+    archived: boolean;
     cluster: string;
     events: number;
     revision: number;
@@ -124,8 +158,25 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
   const report: ImportReport = { schema: "trajecta.import-report/v1", source, sourceRoot: path.resolve(sourceRoot), sourceDigest, tasks: [], skipped: [], registry };
   const op = (kind: string, id: string) => `operation:import-${source}-${kind}-${short(id)}`;
 
+  const archive = new DomainJournal(store.root, ARCHIVED_WORK);
+
   for (const task of projection.tasks) {
     const taskEvents = events.filter((event) => event.task_id === task.task_id).sort((left, right) => left.revision - right.revision);
+    if (TERMINAL.has(task.status)) {
+      const kept = taskEvents.slice(-50).map((event) => ({
+        eventId: event.event_id, kind: event.kind, revision: event.revision,
+        summary: event.summary.slice(0, 1_000), provenance: (event.provenance_refs ?? []).slice(0, 20), recordedAt: event.recorded_at,
+      }));
+      archive.append(op("archive", task.task_id), { source, taskId: task.task_id, digest: canonicalStoreDigest(kept) }, () => ({
+        source, sourceTaskId: task.task_id, cluster: task.cluster, status: task.status, goal: task.goal.slice(0, 1_000), events: kept,
+      }));
+      report.tasks.push({
+        sourceTaskId: task.task_id, workId: null, archived: true, cluster: task.cluster, events: taskEvents.length,
+        revision: 0, sourceRevision: task.revision, closedInSource: true,
+        matches: { openLoops: true, nextAction: true, goal: true },
+      });
+      continue;
+    }
     const open = taskEvents.find((event) => event.kind === "open");
     // Later "open" events on the same task are resumes (AWM/LWM reopen an
     // exact task id with work_open); only the first one created the task.
@@ -229,6 +280,7 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
     report.tasks.push({
       sourceTaskId: task.task_id,
       workId: final.id,
+      archived: false,
       cluster: task.cluster,
       events: taskEvents.length,
       revision: final.revision,
