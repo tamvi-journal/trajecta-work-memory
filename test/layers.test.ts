@@ -273,3 +273,49 @@ test("mcp exposes bootstrap, clusters and context, and refuses secrets", () => {
   const tools = (server.handle({ jsonrpc: "2.0", id: 2, method: "tools/list" }) as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name);
   for (const name of ["work_bootstrap", "work_route_clusters", "work_assign_cluster", "work_context"]) assert.ok(tools.includes(name), name);
 });
+
+test("audit context returns every contract anchor with provenance", () => {
+  const root = tmp();
+  const store = new TrajectaStore(root, clock);
+  let work = openWork(store, "Anchors");
+  const first = store.capture({ operationId: "operation:anchor-1", workId: work.id, expectedRevision: work.revision, surface: local, kind: "contract_anchor", summary: "Contract v1", provenance: ["commit:a1"] });
+  work = store.capture({ operationId: "operation:anchor-2", workId: work.id, expectedRevision: first.work.revision, surface: local, kind: "contract_anchor", summary: "Contract v2", provenance: ["commit:a2", first.delta.id] }).work;
+  const audit = workContext(store, null, { workId: work.id, mode: "audit", budgetChars: 20_000 });
+  const anchors = audit.deltas.filter((delta) => (delta as { kind: string }).kind === "contract_anchor") as Array<{ contract_version: number; provenance: string[]; created_at: string }>;
+  assert.deepEqual(anchors.map((anchor) => anchor.contract_version), [1, 2]);
+  assert.ok(anchors[1].provenance.includes(first.delta.id) && anchors[1].created_at);
+  const normal = workContext(store, null, { workId: work.id, mode: "normal" });
+  assert.ok(normal.deltas.every((delta) => (delta as { kind: string }).kind !== "contract_anchor"));
+  assert.equal(normal.contract_anchor!.version, 2);
+  assert.deepEqual(normal.contract_anchor!.provenance, ["commit:a2", first.delta.id]);
+});
+
+test("context never exceeds its budget, and budget.used is the exact size", () => {
+  const root = tmp();
+  const store = new TrajectaStore(root, clock);
+  let work = openWork(store, "Budget");
+  for (let index = 0; index < 30; index += 1) {
+    work = store.capture({ operationId: `operation:budget-${index}`, workId: work.id, expectedRevision: work.revision, surface: local, kind: "decision", summary: `Decision ${index} ${"z".repeat(index * 7)}` }).work;
+  }
+  const journal = clusterJournal(root, clock);
+  for (let index = 0; index < 40; index += 1) {
+    const extra = openWork(store, `Budget member ${index}`);
+    assign(journal, `operation:budget-assign-${index}`, extra.id, "budget");
+  }
+  for (let budget = 800; budget <= 4_000; budget += 7) {
+    for (const mode of ["normal", "audit"] as const) {
+      try {
+        const result = workContext(store, journal, { workId: work.id, mode, budgetChars: budget });
+        const length = JSON.stringify(result).length;
+        assert.ok(length <= budget, `${mode} ${budget}: ${length}`);
+        assert.equal(result.budget.used, length);
+      } catch (error) {
+        assert.match((error as Error).message, /budget/);
+      }
+    }
+    const listed = workContext(store, journal, { cluster: "budget", mode: "normal", budgetChars: budget });
+    const length = JSON.stringify(listed).length;
+    assert.ok(length <= budget, `list ${budget}: ${length}`);
+    assert.equal(listed.budget.used, length);
+  }
+});

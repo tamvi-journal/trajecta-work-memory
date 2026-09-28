@@ -27,22 +27,42 @@ export interface ContextInput {
 }
 
 function compactDelta(delta: Delta) {
-  return { id: delta.id, revision: delta.revision, kind: delta.kind, summary: delta.summary, provenance: delta.provenance, created_at: delta.createdAt };
+  return {
+    id: delta.id, revision: delta.revision, kind: delta.kind, summary: delta.summary, provenance: delta.provenance, created_at: delta.createdAt,
+    ...(delta.contractVersion !== undefined ? { contract_version: delta.contractVersion, previous_contract_id: delta.previousContractId ?? null } : {}),
+  };
 }
 
-function fit<T extends { deltas: unknown[] }>(base: T, deltas: unknown[], budget: number) {
-  const size = (value: unknown) => JSON.stringify(value).length;
-  const core = { ...base, deltas: [], budget: { chars: budget, used: 0, dropped: deltas.length } };
-  if (size(core) > budget) throw new Error("Work context exceeds the character budget; raise budget_chars or narrow the request");
-  const kept: unknown[] = [];
-  for (const delta of [...deltas].reverse()) {
-    const probe = { ...base, deltas: [delta, ...kept], budget: { chars: budget, used: 0, dropped: deltas.length - kept.length - 1 } };
-    if (size(probe) > budget) break;
-    kept.unshift(delta);
+interface Budget { chars: number; used: number; dropped: number }
+const size = (value: unknown) => JSON.stringify(value).length;
+
+/**
+ * Write the real serialized size into budget.used. Changing `used` changes
+ * the size (more digits), so repeat until the number describes itself.
+ */
+function settle(result: { budget: Budget }) {
+  for (let round = 0; round < 8; round += 1) {
+    const measured = size(result);
+    if (result.budget.used === measured) return measured;
+    result.budget.used = measured;
   }
-  const result = { ...base, deltas: kept, budget: { chars: budget, used: 0, dropped: deltas.length - kept.length } };
-  result.budget.used = size(result);
-  return result;
+  return size(result);
+}
+
+/**
+ * Keep as many items as fit, dropping from `dropFrom` first, and only return
+ * a response whose final serialized size (budget.used included) is within
+ * the budget. Fails closed when nothing but the core state is left and it
+ * still does not fit.
+ */
+function fitList<T extends { budget: Budget }>(make: (kept: unknown[], dropped: number) => T, items: unknown[], budget: number, dropFrom: "start" | "end"): T {
+  const kept = [...items];
+  for (;;) {
+    const result = make(kept, items.length - kept.length);
+    if (settle(result) <= budget) return result;
+    if (!kept.length) throw new Error("Work context exceeds the character budget; raise budget_chars or narrow the request");
+    if (dropFrom === "start") kept.shift(); else kept.pop();
+  }
 }
 
 export function workContext(
@@ -62,16 +82,10 @@ export function workContext(
       .filter((item) => members.has(item.id) && (input.mode === "audit" || !["complete", "abandoned"].includes(item.status)))
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
       .map((item) => ({ work_id: item.id, topic: item.topic, status: item.status, revision: item.revision, next_action: item.nextAction, updated_at: item.updatedAt }));
-    const base = { schema: "trajecta.context/v1", mode: input.mode, cluster: input.cluster, work: [] as unknown[], deltas: [] };
-    const result = fit({ ...base }, [], budget) as typeof base & { budget: { chars: number; used: number; dropped: number } };
-    for (const item of work) {
-      const probe = { ...result, work: [...result.work, item] };
-      if (JSON.stringify(probe).length > budget) break;
-      result.work.push(item);
-    }
-    result.budget.dropped = work.length - result.work.length;
-    result.budget.used = JSON.stringify(result).length;
-    return result;
+    return fitList((kept, dropped) => ({
+      schema: "trajecta.context/v1", mode: input.mode, cluster: input.cluster, work: kept, deltas: [] as unknown[],
+      budget: { chars: budget, used: 0, dropped },
+    }), work, budget, "end");
   }
 
   const item = store.getWork(input.workId);
@@ -79,8 +93,8 @@ export function workContext(
   const history = store.history(item.id);
   const anchor = history.filter((delta) => delta.kind === "contract_anchor").at(-1);
   const selected = history.filter((delta) => {
-    if (delta.kind === "contract_anchor") return false;
-    if (input.mode === "audit") return true;
+    if (input.mode === "audit") return true; // full history, contract anchors included
+    if (delta.kind === "contract_anchor") return false; // summarised in contract_anchor below
     if (input.mode === "debug" && (delta.kind === "blocker" || delta.kind === "correction")) return true;
     return NORMAL_KINDS.has(delta.kind);
   });
@@ -102,9 +116,10 @@ export function workContext(
       updated_at: item.updatedAt,
     },
     active_branch: branch ? { id: branch.id, label: branch.label, purpose: branch.purpose, return_point: branch.returnPoint } : null,
-    contract_anchor: anchor ? { id: anchor.id, version: anchor.contractVersion, summary: anchor.summary } : null,
+    contract_anchor: anchor ? { id: anchor.id, version: anchor.contractVersion, summary: anchor.summary, provenance: anchor.provenance, created_at: anchor.createdAt } : null,
     resume_rule: `Resume only ${item.id} at revision ${item.revision}. Memory is context, not authority.`,
     deltas: [] as unknown[],
   };
-  return fit(base, recent.map(compactDelta), budget);
+  const { deltas: _none, ...fixed } = base;
+  return fitList((kept, dropped) => ({ ...fixed, deltas: kept, budget: { chars: budget, used: 0, dropped } }), recent.map(compactDelta), budget, "start");
 }
