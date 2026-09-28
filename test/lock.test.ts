@@ -322,3 +322,40 @@ test("close resolves its receipt outside the root lock", () => {
   const closed = store.close({ ...next, operationId: "operation:close-ok", surface: local });
   assert.equal(closed.work.status, "complete");
 });
+
+test("a malformed close request never reaches the verifier", () => {
+  const root = tmp();
+  let calls = 0;
+  const store = new TrajectaStore(root, undefined, undefined, { resolveReceipt: () => { calls += 1; return null; } });
+  const work = openWork(store, "malformed");
+  const good = { operationId: "operation:m", workId: work.id, expectedRevision: 1, surface: local, status: "complete" as const, summary: "Done", verificationRef: "receipt:m1", provenance: ["test:ok"] };
+  const bad: Array<Record<string, unknown>> = [
+    { status: "finished" },
+    { summary: "" },
+    { verificationRef: "not a reference" },
+    { surface: { kind: "moon", name: "x", session: "y" } },
+    { provenance: "test:ok" },
+    { provenance: Array.from({ length: 21 }, (_, i) => `test:${i}`) },
+    { provenance: [] },
+    { expectedRevision: 0 },
+    { workId: "nope" },
+  ];
+  for (const change of bad) {
+    assert.throws(() => store.close({ ...good, ...change, operationId: `operation:m-${calls}-${Object.keys(change)[0]}` } as CloseWorkInput), Error, JSON.stringify(change));
+  }
+  assert.equal(calls, 0, "verifier never called for malformed requests");
+  assert.throws(() => store.close(good), ReceiptRejected, "a well-formed request does reach the verifier");
+  assert.equal(calls, 1);
+});
+
+test("timeoutMs is a hard bound even when retryMs is longer", () => {
+  const root = tmp();
+  const work = openWork(new TrajectaStore(root), "bound");
+  fs.mkdirSync(path.join(root, LOCK_DIR));
+  fs.writeFileSync(path.join(root, LOCK_DIR, "owner.json"), JSON.stringify({ schema: "trajecta.write-lock/v1", nonce: "busy", pid: process.pid, hostname: os.hostname(), acquiredAt: new Date().toISOString() }));
+  const store = new TrajectaStore(root, undefined, undefined, { lock: { timeoutMs: 100, retryMs: 5_000 } });
+  const started = Date.now();
+  assert.throws(() => store.capture({ operationId: "operation:bound", workId: work.id, expectedRevision: 1, surface: local, kind: "progress", summary: "x" }), LockTimeout);
+  const waited = Date.now() - started;
+  assert.ok(waited >= 90 && waited < 1_500, `waited ${waited} ms for a 100 ms timeout`);
+});

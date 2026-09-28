@@ -291,6 +291,25 @@ export function writeAtomic(file: string, value: unknown) {
   syncDirectory(path.dirname(file));
 }
 
+/**
+ * Checks that do not depend on the current state. Runs before the verifier
+ * is called, so a malformed request has no external side effect.
+ */
+export function validateCloseInput(input: CloseWorkInput) {
+  assertId(input.operationId, "Operation ID");
+  if (typeof input.workId !== "string" || !/^work:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(input.workId)) throw new Error("Work ID must be a work: ID");
+  if (!Number.isInteger(input.expectedRevision) || input.expectedRevision < 1) throw new Error("Expected revision must be a positive integer");
+  if (input.status !== "complete" && input.status !== "abandoned") throw new Error("Close status must be complete or abandoned");
+  assertText(input.summary, "Close summary", 1_000);
+  assertText(input.verificationRef, "Verification reference", 200);
+  assertId(input.verificationRef, "Verification reference");
+  assertSurface(input.surface);
+  if (!Array.isArray(input.provenance) || input.provenance.length > 20 || input.provenance.some((item) => typeof item !== "string" || !item.trim() || item.length > 200)) {
+    throw new Error("Close provenance must be up to 20 references of at most 200 characters");
+  }
+  if (input.status === "complete" && !input.provenance.length) throw new Error("Closing as complete requires provenance");
+}
+
 /** Digest of a close request, which a work-close receipt must carry. */
 export function closeIntentDigest(input: Pick<CloseWorkInput, "workId" | "expectedRevision" | "status" | "summary" | "provenance">) {
   return canonicalStoreDigest({
@@ -637,6 +656,9 @@ export class TrajectaStore {
     // the verifier.
     const done = this.locked(() => this.replay(input.operationId, input));
     if (done) return done;
+    // A malformed new request must never reach the verifier, which may do
+    // I/O or write to Trajecta.
+    validateCloseInput(input);
     // Stage 2 (no lock): resolve the receipt. The verifier may do slow I/O or
     // read Trajecta itself; holding the root lock here would block every
     // writer or re-enter the lock.
@@ -652,12 +674,7 @@ export class TrajectaStore {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
     this.recoverPending();
-    if (input.status !== "complete" && input.status !== "abandoned") throw new Error("Close status must be complete or abandoned");
-    assertText(input.summary, "Close summary", 1_000);
-    assertText(input.verificationRef, "Verification reference", 200);
-    assertSurface(input.surface);
-    if (!Array.isArray(input.provenance) || input.provenance.some((item) => typeof item !== "string")) throw new Error("Close provenance must be a list of references");
-    if (input.status === "complete" && !input.provenance.length) throw new Error("Closing as complete requires provenance");
+    validateCloseInput(input);
     const state = this.readState();
     const beforeState = structuredClone(state);
     const index = state.work.findIndex((item) => item.id === input.workId);

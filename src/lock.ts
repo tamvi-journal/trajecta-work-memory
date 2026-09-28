@@ -264,7 +264,8 @@ function acquire(root: string, options: LockOptions): LockOwner {
       if (ownerless) throw new LockInDoubt(`Write lock ${lockDir} has no valid owner`);
       throw new LockTimeout(root, lastOwner);
     }
-    sleep(retryMs);
+    // timeoutMs is a hard upper bound: never sleep past the deadline.
+    sleep(Math.min(retryMs, Math.max(1, deadline - Date.now())));
   }
 }
 
