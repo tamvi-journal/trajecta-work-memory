@@ -56,7 +56,7 @@ export interface Delta {
   operationId: string;
   workId: string;
   revision: number;
-  kind: DeltaKind | "open" | "resume";
+  kind: DeltaKind | "open" | "resume" | "close";
   summary: string;
   surface: Surface;
   branchId: string | null;
@@ -129,4 +129,41 @@ export interface RouteMatch {
   matchedCues: string[];
   revision: number;
   updatedAt: string;
+}
+
+export type TerminalStatus = "complete" | "abandoned";
+
+/**
+ * Typed authorisation for closing one work item. Issued by a verifier the
+ * application trusts, resolved by reference; never accepted from the caller
+ * inline. Purpose `work_close` only: it cannot promote an incident, and an
+ * incident-promotion receipt cannot close work.
+ */
+export interface WorkCloseReceipt {
+  schema: "trajecta.work-close-receipt/v1";
+  id: string;
+  purpose: "work_close";
+  workId: string;
+  expectedRevision: number;
+  status: TerminalStatus;
+  /** closeIntentDigest() of the exact close request. */
+  intentDigest: string;
+  /** Who authorised it, e.g. "owner" or "verifier:ci". */
+  authority: string;
+  /** What backs it, e.g. "test", "review", "owner-ack". Required for complete. */
+  evidenceClass: string;
+  outcome: "approved";
+  issuedAt: string;
+  expiresAt?: string;
+}
+
+export interface CloseWorkInput {
+  operationId: string;
+  workId: string;
+  expectedRevision: number;
+  surface: Surface;
+  status: TerminalStatus;
+  summary: string;
+  verificationRef: string;
+  provenance: string[];
 }

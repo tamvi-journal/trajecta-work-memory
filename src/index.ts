@@ -1,4 +1,5 @@
-export { canonicalStoreDigest, OperationConflict, OperationInDoubt, RevisionConflict, TrajectaStore } from "./store.ts";
+export { canonicalStoreDigest, closeIntentDigest, OperationConflict, OperationInDoubt, ReceiptRejected, RevisionConflict, TrajectaStore } from "./store.ts";
+export { LockInDoubt, LockTimeout, NestedRootLock, withRootWriteLock } from "./lock.ts";
 export type { StoreFaultPoint } from "./store.ts";
 export { TrajectaRelay } from "./relay.ts";
 export type * from "./types.ts";

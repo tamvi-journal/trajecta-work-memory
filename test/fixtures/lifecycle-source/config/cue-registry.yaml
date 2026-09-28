@@ -1,0 +1,34 @@
+version: 0.2
+mode: deterministic
+max_clusters_per_turn: 3
+max_cluster_hops: 2
+
+clusters:
+  memory-system:
+    primary:
+      - work memory
+      - memory system
+    aliases:
+      - bootstrap memory
+    detail:
+      - kernel
+      - capability snapshot
+
+  docs-site:
+    primary:
+      - docs site
+    aliases:
+      - documentation
+    detail:
+      - landing page
+
+  empty-cluster:
+    primary:
+    aliases:
+    detail:
+      - nothing
+
+collision_rules:
+  memory_vs_docs: prefer_primary
+fallback:
+  semantic_search: disabled

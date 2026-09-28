@@ -1,0 +1,67 @@
+{
+  "schema_version": 2,
+  "tasks": [
+    {
+      "task_id": "task:11111111-aaaa",
+      "cluster": "memory-system",
+      "status": "waiting",
+      "revision": 10,
+      "goal": "Move memory to the shared backbone. Keep history.",
+      "current_instruction": "Implement phase 1.",
+      "verification_state": "unverified",
+      "active_branch_id": null,
+      "branches": [
+        {
+          "branch_id": "branch:src-1",
+          "label": "cluster projection",
+          "purpose": "Decide cluster storage",
+          "cue_terms": [
+            "cluster",
+            "projection"
+          ],
+          "return_point": "Back to phase plan",
+          "status": "parked",
+          "revision": 5,
+          "last_checkpoint_id": "checkpoint:a5"
+        }
+      ],
+      "open_loops": [
+        "Lam reviews section 3",
+        "Write tests"
+      ],
+      "next_action": "Start phase 1 branch",
+      "waiting_on": "local",
+      "updated_at": "2026-09-29T10:00:00.000Z"
+    },
+    {
+      "task_id": "task:22222222-bbbb",
+      "cluster": "docs-site",
+      "status": "active",
+      "revision": 1,
+      "goal": "Write the docs site",
+      "verification_state": "unverified",
+      "active_branch_id": null,
+      "branches": [],
+      "open_loops": [
+        "Pick a theme"
+      ],
+      "next_action": "Draft landing page",
+      "waiting_on": null,
+      "updated_at": "2026-09-21T10:00:00.000Z"
+    },
+    {
+      "task_id": "task:33333333-cccc",
+      "cluster": "memory-system",
+      "status": "complete",
+      "revision": 3,
+      "goal": "Old experiment",
+      "verification_state": "verified",
+      "active_branch_id": null,
+      "branches": [],
+      "open_loops": [],
+      "next_action": null,
+      "waiting_on": null,
+      "updated_at": "2026-09-23T10:00:00.000Z"
+    }
+  ]
+}
