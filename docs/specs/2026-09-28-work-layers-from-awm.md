@@ -65,19 +65,23 @@ Questions for Lam:
 ## 4. Phases
 
 Each phase is one PR, green on the 3-OS CI, with MCP tools added under
-`work_*` names and a migration test that imports a real AWM state folder.
+`work_*` names. Phase 1 ships a read-only `import-awm` harness; every later
+phase extends it to the records that phase adds, and its migration test
+imports a real AWM state folder.
 
 1. **Routing and boot.** Clusters + cue registry, `work_bootstrap` (kernel
    text from profile, capability snapshot with TTL, canonical entrypoints),
    `work_context` with normal/debug/audit modes and a character budget,
-   recursive secret rejection.
+   recursive secret rejection, and the `import-awm` harness (tasks, branches,
+   checkpoints, open loops, next actions; source opened read-only,
+   provenance kept).
 2. **Learning loop.** Friction and incidents, occurrence tiers, promotion with
    owner receipt, `work_check_action`, work chronicle.
 3. **Investigation and skills.** Cases + hypotheses, skill evolution with
    activate/rollback, authority claims built on relay.
-4. **Migration and view.** `import-awm` / `import-lwm` (read-only source,
-   provenance kept), read-only dashboard, profiles for Aux and Lam, then AWM
-   and LWM MCP servers point at TWM.
+4. **Switch-over and view.** `import-lwm` on the same harness, read-only
+   dashboard, profiles for Aux and Lam, then AWM and LWM MCP servers point at
+   TWM.
 
 ## 5. Acceptance
 
