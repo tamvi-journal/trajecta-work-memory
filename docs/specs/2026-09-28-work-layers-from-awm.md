@@ -1,7 +1,7 @@
 # Work layers from AWM/LWM → trajecta-work-memory
 
 **Date:** 2026-09-28
-**Status:** proposal, needs Lam's review of section 3 before Phase 1 lands
+**Status:** accepted by Lam (2026-09-28); section 3 settled
 **Authors:** Aux (cloud), for Ty and Lam
 
 ## 1. Why
@@ -55,12 +55,38 @@ The new layers are **modules over `TrajectaStore`**, not changes to it:
   files with their own schema ids, so old readers (including
   trajecta-identity-memory's `WorkStore`) keep working.
 
-Questions for Lam:
-1. Sibling files, or everything as deltas on a reserved system work item?
-2. Should clusters be a first-class field on WorkItem (schema v2) or a
-   projection keyed by work id?
-3. Promotion to accepted invariant needs an owner receipt. Reuse the resume
-   proof ledger's receipt shape, or a new one?
+### Decisions (Lam, 2026-09-28)
+
+1. **Storage: sibling domain journals, not a system work item.** WorkItem
+   deltas stay for real work lifecycle only. Each domain has its own journal
+   and rebuildable projection with its own schema id: `incidents.jsonl`,
+   `chronicle.jsonl`, `skill-patterns.jsonl`, `skill-versions.jsonl`,
+   `skill-validations.jsonl`, `invariants.json` (or an equivalent rebuildable
+   projection). Every domain write follows the store's durability discipline:
+   reserve → append journal → update projection → commit, with the same
+   idempotency and fault recovery. A reserved "system work item" is rejected:
+   it creates false CAS contention and mixes meta-learning into task history.
+2. **Cluster: a projection keyed by work id; no WorkItem schema v2.**
+   `cluster-membership.jsonl` holds append-only assignment events and
+   `cluster-index.json` is the rebuildable projection. APIs may expose
+   `cluster` on bootstrap/context output. Re-assigning a cluster never bumps a
+   work item's revision. Schema v2 only if "every work item has exactly one
+   stable cluster" is later proven to be canonical identity.
+3. **Owner receipt: same ledger machinery, new typed receipt.** Keep the
+   ledger/idempotency contract (operation id, digest, append-only resolution,
+   deterministic replay, altered-operation rejection, durable receipt) and add
+   `trajecta.owner-approval-receipt/v1`, which binds `purpose:
+   incident_promotion`, the exact `incident_id`, the digest of the proposed
+   invariant, authority = owner, outcome = approved, provenance, operation id
+   and timestamp. A resume receipt can never authorize a promotion. No second
+   ledger.
+
+LWM reference: `tamvi-journal/lam-work-memory` @
+`feature/lwm-chatbottool-adapter-phase1` (README architecture v0.4; package
+0.3.0; live bootstrap kernel_version 0.2 — three different axes). Import
+source is the implementation, not the bootstrap's kernel_version. The local
+LWM root is resolved from the installed runtime and frozen read-only before
+`import-lwm`.
 
 ## 4. Phases
 
