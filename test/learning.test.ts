@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { TrajectaStore } from "../src/store.ts";
 import { LearningLayer } from "../src/learning.ts";
-import { ApprovalRejected, invariantDigest, issueReceipt, newReceiptId, receiptResolver, type OwnerApprovalReceipt } from "../src/receipts.ts";
+import { ApprovalRejected, invariantDigest, issueReceipt, newReceiptId, receiptJournal, receiptResolver, type OwnerApprovalReceipt } from "../src/receipts.ts";
 import { clusterJournal } from "../src/clusters.ts";
 import { workContext } from "../src/context.ts";
 import { importLifecycle } from "../src/import-lifecycle.ts";
@@ -218,4 +218,37 @@ test("import brings incidents, friction and chronicle; source invariants wait fo
   const again = importLifecycle(store, SOURCE, "awm");
   assert.equal(again.learning.incidents, 3);
   assert.equal(learning.incidents.events().length, 3, "re-import adds nothing");
+});
+
+test("import keeps identical evidence identical, so repeats never climb the tier", () => {
+  const source = tmp();
+  fs.cpSync(SOURCE, source, { recursive: true });
+  const same = (id: string) => JSON.stringify({ id, cluster: "memory-system", kind: "wrong-rail", summary: id, violated_invariant: "observable requested", evidence_refs: ["checkpoint:same"], correction: "c", prevention_rule: "p" });
+  fs.writeFileSync(path.join(source, "state", "incidents.jsonl"), `${same("incident:r1")}\n${same("incident:r2")}\n${same("incident:r3")}\n`);
+  const store = new TrajectaStore(tmp());
+  importLifecycle(store, source, "awm");
+  const events = new LearningLayer(store).incidents.events();
+  assert.deepEqual(events.map((event) => event.tier), ["raw", "raw", "raw"]);
+  assert.deepEqual(events.map((event) => event.evidenceRefs), [["checkpoint:same"], ["checkpoint:same"], ["checkpoint:same"]]);
+  assert.deepEqual(events.map((event) => event.provenance[0]), ["source:awm:incident:r1", "source:awm:incident:r2", "source:awm:incident:r3"]);
+});
+
+test("CLI keeps cues verbatim and refuses approvals work_close could never accept", () => {
+  const root = tmp();
+  const run = (...args: string[]) => spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", CLI, ...args], { env: { ...process.env, TRAJECTA_HOME: root }, encoding: "utf8" });
+  const store = new TrajectaStore(root);
+  let work = store.open({ operationId: "operation:o", topic: "fix dry run handling", goal: "Fix --dry-run handling", surface: local }).work;
+  const routed = run("route", "fix", "--dry-run", "handling");
+  assert.equal(routed.status, 0, routed.stderr);
+  assert.equal(JSON.parse(routed.stdout)[0].workId, work.id);
+  assert.equal(run("route", "--dry-run").status, 0);
+  const noProvenance = run("approve-close", work.id, "complete", "--summary", "Done");
+  assert.equal(noProvenance.status, 1);
+  assert.match(noProvenance.stderr, /provenance/);
+  work = store.capture({ operationId: "operation:loops", workId: work.id, expectedRevision: work.revision, surface: local, kind: "next_action", summary: "loops", openLoops: ["left"], nextAction: "x" }).work;
+  const withLoops = run("approve-close", work.id, "complete", "--summary", "Done", "--provenance", "test:ok");
+  assert.equal(withLoops.status, 1);
+  assert.match(withLoops.stderr, /open loop/);
+  assert.equal(run("approve-close", work.id, "abandoned", "--summary", "Dropped").status, 0, "abandoned may keep loops");
+  assert.equal(Object.keys(receiptJournal(root).read().byId).length, 1, "refused approvals issued nothing");
 });

@@ -1,6 +1,6 @@
 #!/usr/bin/env -S node --experimental-strip-types
 import process from "node:process";
-import { closeIntentDigest, TrajectaStore } from "./store.ts";
+import { closeIntentDigest, TrajectaStore, validateCloseInput } from "./store.ts";
 import { importLifecycle } from "./import-lifecycle.ts";
 import { defaultRoot } from "./mcp.ts";
 import { INCIDENTS } from "./learning.ts";
@@ -66,7 +66,9 @@ Owner approvals (run these yourself; agents cannot issue receipts over MCP):
 `;
 
 try {
-  const { positional: args, named } = flags(rest);
+  // Only the approval commands take --options; every other command keeps its
+  // arguments verbatim (a cue may well contain "--").
+  const { positional: args, named } = command?.startsWith("approve-") ? flags(rest) : { positional: rest, named: {} as Record<string, string> };
   if (command === "list") print(store.list());
   else if (command === "route") print(store.route(args.join(" ")));
   else if (command === "packet") {
@@ -108,6 +110,15 @@ try {
     }
     const work = store.getWork(workId);
     const provenance = list(named.provenance);
+    // Refuse an approval that work_close could never accept.
+    validateCloseInput({
+      operationId: "operation:approval-check", workId, expectedRevision: work.revision,
+      surface: { kind: "local", name: "owner", session: "local:cli" }, status, summary: named.summary,
+      verificationRef: "receipt:approval-check", provenance,
+    });
+    if (status === "complete" && work.openLoops.length) {
+      throw new Error(`Work still has ${work.openLoops.length} open loop(s); complete close would be refused. Resolve them or approve an abandoned close.`);
+    }
     const now = new Date();
     const receipt: WorkCloseReceipt = {
       schema: "trajecta.work-close-receipt/v1",

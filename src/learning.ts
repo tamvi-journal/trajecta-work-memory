@@ -73,6 +73,8 @@ export interface Incident extends JournalEvent {
   correction: string;
   preventionRule: string;
   rootCause: string | null;
+  /** Where this record came from (e.g. an import). Never counted as evidence. */
+  provenance: string[];
   surface: Surface;
   groupKey: string;
   occurrence: number;
@@ -289,6 +291,7 @@ export class LearningLayer {
   recordIncident(operationId: string, input: {
     workId?: string | null; cluster: string; kind: string; summary: string; violatedInvariant: string;
     evidenceRefs: string[]; correction: string; preventionRule: string; rootCause?: string | null; surface: Surface;
+    provenance?: string[];
   }) {
     const body = {
       workId: this.workOrNull(input.workId),
@@ -300,6 +303,7 @@ export class LearningLayer {
       correction: text(input.correction, "correction", 1_000),
       preventionRule: text(input.preventionRule, "prevention_rule", 1_000),
       rootCause: input.rootCause ? text(input.rootCause, "root_cause", 300) : null,
+      provenance: refs(input.provenance, "provenance"),
       surface: input.surface,
     };
     if (!body.evidenceRefs.length) throw new Error("An incident needs at least one evidence reference");

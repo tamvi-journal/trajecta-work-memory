@@ -335,7 +335,10 @@ function importLearning(
       const result = learning.recordIncident(op("incident", String(item.id)), {
         workId: item.task_id ? workFor.get(item.task_id) ?? null : null,
         cluster: item.cluster, kind: item.kind, summary: item.summary, violatedInvariant: item.violated_invariant,
-        evidenceRefs: [...(item.evidence_refs ?? []), `source:${source}:${item.id}`].slice(0, 20),
+        // Evidence stays exactly as recorded so identical evidence keeps the
+        // same tier; the source id goes to provenance, which is never counted.
+        evidenceRefs: item.evidence_refs ?? [],
+        provenance: [`source:${source}:${item.id}`],
         correction: item.correction, preventionRule: item.prevention_rule, rootCause: item.root_cause ?? null, surface,
       });
       incidentIds.set(String(item.id), result.event.id);
