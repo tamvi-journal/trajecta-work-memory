@@ -140,7 +140,7 @@ function syncDirectory(directoryPath: string) {
   try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
 }
 
-function appendJsonl(file: string, value: unknown) {
+export function appendJsonl(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const existed = fs.existsSync(file);
   const descriptor = fs.openSync(file, "a", 0o600);
@@ -276,7 +276,7 @@ function readJsonl<T>(file: string, role: "operations" | "deltas"): T[] {
   }
 }
 
-function writeAtomic(file: string, value: unknown) {
+export function writeAtomic(file: string, value: unknown) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
   const descriptor = fs.openSync(temporary, "wx", 0o600);

@@ -10,10 +10,15 @@ import os from "node:os";
 import path from "node:path";
 import { RevisionConflict, TrajectaStore } from "./store.ts";
 import { TrajectaRelay } from "./relay.ts";
+import { bootstrap, CAPABILITY_SNAPSHOTS, loadProfile, type WorkProfile } from "./boot.ts";
+import { CLUSTER_ID, clusterJournal, routeClusters } from "./clusters.ts";
+import { workContext, type ContextMode } from "./context.ts";
+import { DomainJournal } from "./journal.ts";
+import { assertSafe, UnsafeInput } from "./safety.ts";
 import type { DeltaKind, Surface, SurfaceKind } from "./types.ts";
 
 export const SERVER_NAME = "trajecta-work-memory";
-export const SERVER_VERSION = "0.2.0";
+export const SERVER_VERSION = "0.3.0";
 const CAPTURE_KINDS: DeltaKind[] = [
   "instruction", "decision", "progress", "blocker", "correction", "next_action",
   "branch_open", "branch_park", "synthesis", "outcome", "contract_anchor",
@@ -104,6 +109,28 @@ export const TOOLS = [
   tool("work_packet", "Render a bounded transfer packet for one work item without changing anything.",
     { work_id: str, cue: { type: "string", minLength: 1, maxLength: 500 }, target: { type: "string", enum: ["cloud", "local"] } },
     ["work_id", "cue", "target"]),
+  tool("work_bootstrap", "Call once at the start of a session: returns the working rules (kernel), a capability snapshot for this surface, canonical entrypoints, known clusters and the open-work index.",
+    {
+      evidence: {
+        type: "object",
+        description: "What this surface can use right now (observation, not authorisation).",
+        properties: { directTools: strs, executors: strs, skills: strs, memoryBackends: strs, unknowns: strs, gotchas: strs },
+        additionalProperties: false,
+      },
+      operation_id: opId,
+    }, [], W),
+  tool("work_route_clusters", "Route a message to clusters with the cue registry (deterministic: primary > alias > detail).",
+    { message: { type: "string", minLength: 1, maxLength: 2000 }, active_clusters: strs }, ["message"]),
+  tool("work_assign_cluster", "Put a work item in a cluster. Does not change the work item's revision.",
+    { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, reason: { type: "string", minLength: 1, maxLength: 300 }, operation_id: opId },
+    ["work_id", "cluster", "reason"], W),
+  tool("work_context", "Bounded context for one work item (or the open work in one cluster). mode: normal | debug | audit.",
+    {
+      work_id: str,
+      cluster: { type: "string", pattern: CLUSTER_ID.source },
+      mode: { type: "string", enum: ["normal", "debug", "audit"] },
+      budget_chars: { type: "integer", minimum: 800, maximum: 60000 },
+    }, ["mode"]),
 ];
 
 function summarize(item: ReturnType<TrajectaStore["getWork"]>) {
@@ -124,9 +151,15 @@ function branchInput(value: unknown) {
 export class WorkServer {
   readonly store: TrajectaStore;
   readonly surface: Surface;
-  constructor(store: TrajectaStore, surface: Surface) {
+  readonly profile: WorkProfile;
+  private readonly clusters;
+  private readonly capabilities;
+  constructor(store: TrajectaStore, surface: Surface, options: { profile?: WorkProfile } = {}) {
     this.store = store;
     this.surface = surface;
+    this.profile = options.profile ?? loadProfile(store.root);
+    this.clusters = clusterJournal(store.root);
+    this.capabilities = new DomainJournal(store.root, CAPABILITY_SNAPSHOTS);
   }
 
   private op(args: Json) {
@@ -135,8 +168,36 @@ export class WorkServer {
   }
 
   callTool(name: string, args: Json): unknown {
+    assertSafe(args, "arguments");
     const s = this.store;
     switch (name) {
+      case "work_bootstrap":
+        return bootstrap(s, this.profile, this.capabilities, this.clusters, {
+          operationId: this.op(args), surface: this.surface, evidence: args.evidence as Record<string, string[]> | undefined,
+        });
+      case "work_route_clusters": {
+        if (!this.profile.cueRegistry) return { selected: [], note: "This profile has no cue registry; use work_route to match work items by cue." };
+        return routeClusters(this.profile.cueRegistry, String(args.message), (args.active_clusters as string[] | undefined) ?? []);
+      }
+      case "work_assign_cluster": {
+        const workId = String(args.work_id);
+        const cluster = String(args.cluster);
+        s.getWork(workId);
+        if (!CLUSTER_ID.test(cluster)) throw new Error("Invalid cluster id");
+        const registry = this.profile.cueRegistry;
+        if (registry && !(cluster in registry.clusters)) throw new Error(`Unknown cluster ${cluster}; known: ${Object.keys(registry.clusters).join(", ")}`);
+        const result = this.clusters.append(this.op(args), { workId, cluster, reason: String(args.reason) }, () => ({
+          type: "assign" as const, workId, cluster, reason: String(args.reason), surface: this.surface,
+        }));
+        return { work_id: workId, cluster, event_id: result.event.id, replayed: result.replayed };
+      }
+      case "work_context":
+        return workContext(s, this.clusters, {
+          workId: typeof args.work_id === "string" ? args.work_id : undefined,
+          cluster: typeof args.cluster === "string" ? args.cluster : undefined,
+          mode: String(args.mode) as ContextMode,
+          budgetChars: args.budget_chars === undefined ? undefined : Number(args.budget_chars),
+        });
       case "work_list":
         return { work: s.list().map(summarize) };
       case "work_route":
@@ -204,7 +265,7 @@ export class WorkServer {
         protocolVersion: params.protocolVersion ?? "2025-06-18",
         capabilities: { tools: { listChanged: false } },
         serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
-        instructions: `Work memory for the ${this.surface.kind} surface "${this.surface.name}". Route by cue, then read, capture or hand off with the expected revision.`,
+        instructions: `Work memory for the ${this.surface.kind} surface "${this.surface.name}" (profile ${this.profile.name}). Call work_bootstrap first. Route by cue, then read, capture or hand off with the expected revision.`,
       });
     }
     if (method === "ping") return ok({});
@@ -218,7 +279,9 @@ export class WorkServer {
       } catch (error) {
         const message = error instanceof RevisionConflict
           ? `${error.message}. Read the work again (work_get) and retry with revision ${error.latest.revision}.`
-          : `${error instanceof Error ? error.name : "Error"}: ${error instanceof Error ? error.message : String(error)}`;
+          : error instanceof UnsafeInput
+            ? `${error.message}. Remove secrets and execution payloads from the arguments.`
+            : `${error instanceof Error ? error.name : "Error"}: ${error instanceof Error ? error.message : String(error)}`;
         return ok({ content: [{ type: "text", text: message }], isError: true });
       }
     }
@@ -227,7 +290,9 @@ export class WorkServer {
 }
 
 export async function runStdio(env: NodeJS.ProcessEnv = process.env) {
-  const server = new WorkServer(new TrajectaStore(defaultRoot(env)), surfaceFrom(env));
+  const root = defaultRoot(env);
+  const profile = loadProfile(root, env.TRAJECTA_PROFILE?.trim() || undefined);
+  const server = new WorkServer(new TrajectaStore(root), surfaceFrom(env), { profile });
   process.stdin.setEncoding("utf8");
   let buffer = "";
   for await (const chunk of process.stdin) {
