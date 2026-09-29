@@ -158,6 +158,10 @@ test("friction climbs by occurrence", () => {
   const { learning } = setup();
   const record = (n: number) => learning.recordFriction(`operation:f${n}`, { cluster: "browser", component: "bridge", kind: "timeout", summary: "slow", surface: local }).event.tier;
   assert.deepEqual([record(1), record(2), record(3)], ["raw", "repeated", "learning_candidate"]);
+  assert.equal(learning.friction.events()[0].provenance, undefined, "no provenance field unless given");
+  const sourced = learning.recordFriction("operation:f4", { cluster: "browser", component: "bridge", kind: "timeout", summary: "slow", provenance: ["tool:bridge-log"], surface: local });
+  assert.deepEqual(sourced.event.provenance, ["tool:bridge-log"]);
+  assert.equal(sourced.event.occurrence, 4, "provenance never changes the count");
 });
 
 test("owner CLI issues receipts; agents close work and promote incidents over MCP with them", () => {
@@ -205,6 +209,7 @@ test("import brings incidents, friction and chronicle; source invariants wait fo
   const report = importLifecycle(store, SOURCE, "awm");
   assert.equal(report.learning.incidents, 3);
   assert.equal(report.learning.friction, 1);
+  assert.deepEqual(new LearningLayer(store).friction.events()[0].provenance, ["source:awm:friction:f1"], "imported friction keeps its source id");
   assert.equal(report.learning.milestones, 1, "chronicle of the archived task is skipped");
   assert.ok(report.skipped.some((item) => item.eventId === "incident:bad"));
   assert.ok(report.skipped.some((item) => item.eventId === "chronicle:m2"));

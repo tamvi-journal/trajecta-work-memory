@@ -351,7 +351,8 @@ function importLearning(
     try {
       learning.recordFriction(op("friction", String(item.id)), {
         workId: item.task_id ? workFor.get(item.task_id) ?? null : null,
-        cluster: item.cluster, component: item.component, kind: item.kind, summary: item.summary, surface,
+        cluster: item.cluster, component: item.component, kind: item.kind, summary: item.summary,
+        provenance: [`source:${source}:${item.id}`], surface,
       });
       report.learning.friction += 1;
     } catch (error) {
