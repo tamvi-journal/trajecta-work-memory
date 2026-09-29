@@ -46,6 +46,14 @@ export class TrajectaRelay {
       ...(input.targetActor !== undefined ? { targetActor: input.targetActor } : {}),
       ...(input.claimEpoch !== undefined ? { claimEpoch: input.claimEpoch } : {}),
     });
+    if (input.targetActor !== undefined && captured.work.pendingHandoff?.handoffDeltaId === captured.delta.id) {
+      // A replayed handoff whose binding was since resumed or cancelled must
+      // not produce a packet without its recipient.
+      const current = this.store.getWork(input.workId).pendingHandoff;
+      if (current?.handoffDeltaId !== captured.delta.id) {
+        throw new Error("This handoff was already resumed or cancelled; there is no packet to make for it");
+      }
+    }
     const packet = this.store.transfer(input.workId, input.cue, input.target, input.maxBytes);
     const receipt: TransportReceipt = { level: "packet-created", reference: packet.packetId };
     return { packet, receipt, work: captured.work };

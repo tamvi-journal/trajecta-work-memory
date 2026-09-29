@@ -168,6 +168,10 @@ try {
       const existing = validateProfile(JSON.parse(fs.readFileSync(file, "utf8")));
       if (JSON.stringify(existing) !== JSON.stringify(profile)) throw new Error(`${file} already holds a different profile; edit or remove it yourself`);
     } else {
+      // Never turn an existing store (for example a private one) into an exchange.
+      if (fs.existsSync(exchangeRoot) && fs.readdirSync(exchangeRoot).length) {
+        throw new Error(`${exchangeRoot} is not empty; an exchange must start in an empty folder (it may hold a private store)`);
+      }
       fs.mkdirSync(exchangeRoot, { recursive: true });
       fs.writeFileSync(file, `${JSON.stringify(profile, null, 2)}\n`);
     }

@@ -131,6 +131,8 @@ test("packets carry the exact recipient, and accept checks kind and actor", () =
   assert.equal(sent.packet.intendedActor, "lam");
   assert.throws(() => new TrajectaRelay(store, { ...auxLocal, session: "local:aux-2" }).accept(sent.packet, "operation:a1"), /intended for lam/);
   assert.equal(new TrajectaRelay(store, lamLocal).accept(sent.packet, "operation:a2").work.lastSurface.actor, "lam");
+  assert.throws(() => new TrajectaRelay(store, auxLocal).handoff({ operationId: "operation:h", workId: work.id, expectedRevision: 1, summary: "to lam", provenance: [], openLoops: [], nextAction: null, target: "local", cue: "c", targetActor: "lam" }),
+    /already resumed or cancelled/, "a replayed handoff never yields a packet without its recipient");
 });
 
 test("startup: an exchange server must run as a registered actor on a registered surface; private stays actor-free", () => {
@@ -162,6 +164,12 @@ test("exchange-init writes the profile once and prints one MCP entry per actor s
   const changed = run("--actors", "aux:local", "--owner", "ty");
   assert.notEqual(changed.status, 0);
   assert.match(changed.stderr, /different profile/);
+  const privateRoot = tmp();
+  new TrajectaStore(privateRoot).open({ operationId: "operation:open", topic: "mine", goal: "private", surface: { kind: "local", name: "Aux", session: "local:aux" } });
+  const over = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", CLI, "exchange-init", privateRoot, "--actors", "aux:local", "--owner", "ty"], { encoding: "utf8" });
+  assert.notEqual(over.status, 0, "an existing private store is never turned into an exchange");
+  assert.match(over.stderr, /not empty/);
+  assert.equal(fs.existsSync(path.join(privateRoot, PROFILE_FILE)), false);
 });
 
 test("claims in the exchange are fenced per actor, and ClaimConflict names the holder", () => {
