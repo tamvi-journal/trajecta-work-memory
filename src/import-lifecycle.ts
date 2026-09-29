@@ -18,6 +18,7 @@ import path from "node:path";
 import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
 import { clusterJournal, parseLegacyCueRegistry, type CueRegistry } from "./clusters.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
+import { CHRONICLE_STAGES, LearningLayer, type ChronicleStage } from "./learning.ts";
 import type { BranchInput, CaptureDeltaInput, DeltaKind, Surface, WorkItem } from "./types.ts";
 
 export type LifecycleSource = "awm" | "lwm";
@@ -135,6 +136,13 @@ export interface ImportReport {
   }>;
   skipped: Array<{ eventId: string; reason: string }>;
   registry: CueRegistry | null;
+  learning: {
+    incidents: number;
+    friction: number;
+    milestones: number;
+    /** Source invariants are never activated on import; the owner re-approves them. */
+    invariantsPendingReapproval: Array<{ sourceId: string; cluster: string; rule: string; sourceIncidentId: string | null; importedIncidentId: string | null }>;
+  };
 }
 
 export function sourceFiles(sourceRoot: string) {
@@ -143,6 +151,10 @@ export function sourceFiles(sourceRoot: string) {
     events: path.join(state, "lifecycle-events.jsonl"),
     projection: path.join(state, "lifecycle-projection.json"),
     registry: path.join(sourceRoot, "config", "cue-registry.yaml"),
+    incidents: path.join(state, "incidents.jsonl"),
+    friction: path.join(state, "friction.jsonl"),
+    chronicle: path.join(state, "chronicle.jsonl"),
+    invariants: path.join(state, "invariants.json"),
   };
 }
 
@@ -155,7 +167,10 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
   const registry = fs.existsSync(files.registry) ? parseLegacyCueRegistry(fs.readFileSync(files.registry, "utf8")) : null;
   const sourceDigest = canonicalStoreDigest({ projection, events });
   const clusters = clusterJournal(store.root);
-  const report: ImportReport = { schema: "trajecta.import-report/v1", source, sourceRoot: path.resolve(sourceRoot), sourceDigest, tasks: [], skipped: [], registry };
+  const report: ImportReport = {
+    schema: "trajecta.import-report/v1", source, sourceRoot: path.resolve(sourceRoot), sourceDigest, tasks: [], skipped: [], registry,
+    learning: { incidents: 0, friction: 0, milestones: 0, invariantsPendingReapproval: [] },
+  };
   const op = (kind: string, id: string) => `operation:import-${source}-${kind}-${short(id)}`;
 
   const archive = new DomainJournal(store.root, ARCHIVED_WORK);
@@ -293,5 +308,78 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
       },
     });
   }
+  importLearning(store, files, source, report, op);
   return report;
+}
+
+/**
+ * Incidents, friction and chronicle keep their history (tiers are recomputed
+ * from the same evidence). Accepted invariants are listed for the owner to
+ * re-approve: an import never fabricates an approval.
+ */
+function importLearning(
+  store: TrajectaStore,
+  files: ReturnType<typeof sourceFiles>,
+  source: LifecycleSource,
+  report: ImportReport,
+  op: (kind: string, id: string) => string,
+) {
+  const learning = new LearningLayer(store);
+  const workFor = new Map(report.tasks.filter((task) => task.workId).map((task) => [task.sourceTaskId, task.workId as string]));
+  const surface = surfaceOf(`${source}-import`, "import");
+  const incidentIds = new Map<string, string>();
+  const skip = (id: unknown, reason: string) => report.skipped.push({ eventId: String(id ?? "unknown"), reason });
+
+  for (const item of readJsonLines(files.incidents) as Array<Record<string, any>>) {
+    try {
+      const result = learning.recordIncident(op("incident", String(item.id)), {
+        workId: item.task_id ? workFor.get(item.task_id) ?? null : null,
+        cluster: item.cluster, kind: item.kind, summary: item.summary, violatedInvariant: item.violated_invariant,
+        // Evidence stays exactly as recorded so identical evidence keeps the
+        // same tier; the source id goes to provenance, which is never counted.
+        evidenceRefs: item.evidence_refs ?? [],
+        provenance: [`source:${source}:${item.id}`],
+        correction: item.correction, preventionRule: item.prevention_rule, rootCause: item.root_cause ?? null, surface,
+      });
+      incidentIds.set(String(item.id), result.event.id);
+      report.learning.incidents += 1;
+    } catch (error) {
+      skip(item.id, `incident: ${(error as Error).message}`);
+    }
+  }
+  for (const item of readJsonLines(files.friction) as Array<Record<string, any>>) {
+    try {
+      learning.recordFriction(op("friction", String(item.id)), {
+        workId: item.task_id ? workFor.get(item.task_id) ?? null : null,
+        cluster: item.cluster, component: item.component, kind: item.kind, summary: item.summary, surface,
+      });
+      report.learning.friction += 1;
+    } catch (error) {
+      skip(item.id, `friction: ${(error as Error).message}`);
+    }
+  }
+  for (const item of readJsonLines(files.chronicle) as Array<Record<string, any>>) {
+    const workId = workFor.get(item.task_id);
+    if (!workId) { skip(item.id, "chronicle: task was not imported as live work"); continue; }
+    if (!(CHRONICLE_STAGES as readonly string[]).includes(item.stage)) { skip(item.id, `chronicle: unknown stage ${item.stage}`); continue; }
+    try {
+      learning.recordMilestone(op("milestone", String(item.id)), {
+        workId, cluster: item.cluster ?? null, stage: item.stage as ChronicleStage, summary: item.summary,
+        provenance: [...(item.provenance_refs ?? []), `source:${source}:${item.id}`].slice(0, 20), surface,
+      });
+      report.learning.milestones += 1;
+    } catch (error) {
+      skip(item.id, `chronicle: ${(error as Error).message}`);
+    }
+  }
+  if (fs.existsSync(files.invariants)) {
+    const parsed = JSON.parse(fs.readFileSync(files.invariants, "utf8")) as { invariants?: Array<Record<string, any>> };
+    for (const item of parsed.invariants ?? []) {
+      report.learning.invariantsPendingReapproval.push({
+        sourceId: String(item.id), cluster: String(item.cluster), rule: String(item.rule),
+        sourceIncidentId: item.source_incident_id ?? null,
+        importedIncidentId: item.source_incident_id ? incidentIds.get(item.source_incident_id) ?? null : null,
+      });
+    }
+  }
 }

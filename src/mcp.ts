@@ -15,10 +15,12 @@ import { CLUSTER_ID, clusterJournal, hasCluster, routeClusters } from "./cluster
 import { workContext, type ContextMode } from "./context.ts";
 import { DomainJournal } from "./journal.ts";
 import { assertSafe, UnsafeInput } from "./safety.ts";
+import { CHRONICLE_STAGES, LearningLayer, type ChronicleStage } from "./learning.ts";
+import { receiptResolver } from "./receipts.ts";
 import type { DeltaKind, Surface, SurfaceKind } from "./types.ts";
 
 export const SERVER_NAME = "trajecta-work-memory";
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 const CAPTURE_KINDS: DeltaKind[] = [
   "instruction", "decision", "progress", "blocker", "correction", "next_action",
   "branch_open", "branch_park", "synthesis", "outcome", "contract_anchor",
@@ -124,6 +126,42 @@ export const TOOLS = [
   tool("work_assign_cluster", "Put a work item in a cluster. Does not change the work item's revision.",
     { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, reason: { type: "string", minLength: 1, maxLength: 300 }, operation_id: opId },
     ["work_id", "cluster", "reason"], W),
+  tool("work_record_incident", "Record an incident: an agent broke a rule, chose the wrong rail or lost the goal. Same cluster+kind+violated invariant with distinct evidence climbs raw → repeated → learning_candidate. Never becomes policy by itself.",
+    {
+      work_id: str,
+      cluster: { type: "string", pattern: CLUSTER_ID.source },
+      kind: { type: "string", maxLength: 64 },
+      summary: { type: "string", minLength: 1, maxLength: 1000 },
+      violated_invariant: { type: "string", minLength: 1, maxLength: 500 },
+      evidence_refs: { ...strs, minItems: 1 },
+      correction: { type: "string", minLength: 1, maxLength: 1000 },
+      prevention_rule: { type: "string", minLength: 1, maxLength: 1000 },
+      root_cause: { type: "string", maxLength: 300 },
+      operation_id: opId,
+    }, ["cluster", "kind", "summary", "violated_invariant", "evidence_refs", "correction", "prevention_rule"], W),
+  tool("work_record_friction", "Record friction: a tool or system was hard to use (not an agent mistake).",
+    { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, component: { type: "string", maxLength: 64 }, kind: { type: "string", maxLength: 64 }, summary: { type: "string", minLength: 1, maxLength: 1000 }, operation_id: opId },
+    ["cluster", "component", "kind", "summary"], W),
+  tool("work_record_milestone", "Add one chronicle milestone to a work item (goal, decision, rail, action, outcome, blocker, correction, next_action). Never a transcript.",
+    { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, stage: { type: "string", enum: [...CHRONICLE_STAGES] }, summary: { type: "string", minLength: 1, maxLength: 1000 }, provenance: strs, operation_id: opId },
+    ["work_id", "stage", "summary"], W),
+  tool("work_promote_incident", "Turn a learning_candidate incident into an accepted prevention rule. Needs an owner-approval receipt the owner issued with `trajecta approve-promotion`; agents cannot issue one.",
+    { incident_id: str, approval_ref: str, operation_id: opId }, ["incident_id", "approval_ref"], W),
+  tool("work_check_action", "Before a consequential action: the profile's guards that block it, and the accepted rules for the cluster to apply. Does not run the action.",
+    {
+      cluster: { type: "string", pattern: CLUSTER_ID.source },
+      action_summary: { type: "string", minLength: 1, maxLength: 1000 },
+      requested_surface: { type: "string", maxLength: 40 },
+      target_name: { type: "string", maxLength: 200 },
+      semantic_identity_proof: { type: "string", maxLength: 500 },
+      repeated_attempts: { type: "integer", minimum: 0 },
+      progress_marker: { type: "string", maxLength: 500 },
+    }, ["cluster", "action_summary"]),
+  tool("work_close", "Close a work item as complete or abandoned. Needs a work-close receipt the owner issued with `trajecta approve-close` for this exact revision and request.",
+    {
+      work_id: str, expected_revision: rev, status: { type: "string", enum: ["complete", "abandoned"] },
+      summary: { type: "string", minLength: 1, maxLength: 1000 }, verification_ref: str, provenance: strs, operation_id: opId,
+    }, ["work_id", "expected_revision", "status", "summary", "verification_ref"], W),
   tool("work_context", "Bounded context for one work item (or the open work in one cluster). mode: normal | debug | audit.",
     {
       work_id: str,
@@ -154,12 +192,14 @@ export class WorkServer {
   readonly profile: WorkProfile;
   private readonly clusters;
   private readonly capabilities;
-  constructor(store: TrajectaStore, surface: Surface, options: { profile?: WorkProfile } = {}) {
+  readonly learning: LearningLayer;
+  constructor(store: TrajectaStore, surface: Surface, options: { profile?: WorkProfile; resolveReceipt?: (reference: string) => unknown } = {}) {
     this.store = store;
     this.surface = surface;
     this.profile = options.profile ?? loadProfile(store.root);
     this.clusters = clusterJournal(store.root);
     this.capabilities = new DomainJournal(store.root, CAPABILITY_SNAPSHOTS);
+    this.learning = new LearningLayer(store, { resolveReceipt: options.resolveReceipt ?? receiptResolver(store.root), guards: this.profile.guards });
   }
 
   private op(args: Json) {
@@ -191,13 +231,53 @@ export class WorkServer {
         }));
         return { work_id: workId, cluster, event_id: result.event.id, replayed: result.replayed };
       }
+      case "work_record_incident": {
+        const result = this.learning.recordIncident(this.op(args), {
+          workId: args.work_id as string | undefined, cluster: String(args.cluster), kind: String(args.kind), summary: String(args.summary),
+          violatedInvariant: String(args.violated_invariant), evidenceRefs: (args.evidence_refs as string[]) ?? [], correction: String(args.correction),
+          preventionRule: String(args.prevention_rule), rootCause: args.root_cause as string | undefined, surface: this.surface,
+        });
+        const incident = result.event;
+        return { incident_id: incident.id, tier: incident.tier, occurrence: incident.occurrence, learning_evidence_count: incident.learningEvidenceCount, replayed: result.replayed };
+      }
+      case "work_record_friction": {
+        const result = this.learning.recordFriction(this.op(args), {
+          workId: args.work_id as string | undefined, cluster: String(args.cluster), component: String(args.component), kind: String(args.kind), summary: String(args.summary), surface: this.surface,
+        });
+        return { friction_id: result.event.id, tier: result.event.tier, occurrence: result.event.occurrence, replayed: result.replayed };
+      }
+      case "work_record_milestone": {
+        const result = this.learning.recordMilestone(this.op(args), {
+          workId: String(args.work_id), cluster: args.cluster as string | undefined, stage: args.stage as ChronicleStage,
+          summary: String(args.summary), provenance: args.provenance as string[] | undefined, surface: this.surface,
+        });
+        return { milestone_id: result.event.id, replayed: result.replayed };
+      }
+      case "work_promote_incident": {
+        const result = this.learning.promoteIncident(this.op(args), { incidentId: String(args.incident_id), approvalRef: String(args.approval_ref), surface: this.surface });
+        return { invariant_id: result.event.invariantId, rule: result.event.rule, cluster: result.event.cluster, replayed: result.replayed };
+      }
+      case "work_check_action":
+        return this.learning.checkAction({
+          cluster: String(args.cluster), actionSummary: String(args.action_summary), requestedSurface: args.requested_surface as string | undefined,
+          targetName: args.target_name as string | undefined, semanticIdentityProof: args.semantic_identity_proof as string | undefined,
+          repeatedAttempts: args.repeated_attempts as number | undefined, progressMarker: args.progress_marker as string | undefined,
+        });
+      case "work_close": {
+        const closed = s.close({
+          operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision), surface: this.surface,
+          status: args.status as "complete" | "abandoned", summary: String(args.summary), verificationRef: String(args.verification_ref),
+          provenance: (args.provenance as string[]) ?? [],
+        });
+        return { work: summarize(closed.work), delta: { id: closed.delta.id, revision: closed.delta.revision } };
+      }
       case "work_context":
         return workContext(s, this.clusters, {
           workId: typeof args.work_id === "string" ? args.work_id : undefined,
           cluster: typeof args.cluster === "string" ? args.cluster : undefined,
           mode: String(args.mode) as ContextMode,
           budgetChars: args.budget_chars === undefined ? undefined : Number(args.budget_chars),
-        });
+        }, this.learning);
       case "work_list":
         return { work: s.list().map(summarize) };
       case "work_route":
@@ -292,7 +372,8 @@ export class WorkServer {
 export async function runStdio(env: NodeJS.ProcessEnv = process.env) {
   const root = defaultRoot(env);
   const profile = loadProfile(root, env.TRAJECTA_PROFILE?.trim() || undefined);
-  const server = new WorkServer(new TrajectaStore(root), surfaceFrom(env), { profile });
+  const resolveReceipt = receiptResolver(root);
+  const server = new WorkServer(new TrajectaStore(root, undefined, undefined, { resolveReceipt }), surfaceFrom(env), { profile, resolveReceipt });
   process.stdin.setEncoding("utf8");
   let buffer = "";
   for await (const chunk of process.stdin) {

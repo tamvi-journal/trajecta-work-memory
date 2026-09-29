@@ -9,3 +9,7 @@ export type { ResumeAttemptCode, ResumeAttemptInputV1, ResumeAttemptReceiptV1, R
 export { ResumeAttemptLedger } from "./adapters/proof/attempt-ledger.ts";
 export { attemptVerifiedResume, inspectVerifiedResume } from "./adapters/proof/attempt-resume.ts";
 export { renderResumeReceipt } from "./adapters/proof/receipt-renderer.ts";
+export { LearningLayer, GUARDS, GUARD_IDS, CHRONICLE_STAGES } from "./learning.ts";
+export type { CheckActionInput, GuardId, Incident, Invariant, Milestone, Friction, Tier } from "./learning.ts";
+export { ApprovalRejected, assertOwnerApproval, invariantDigest, issueReceipt, newReceiptId, receiptJournal, receiptResolver } from "./receipts.ts";
+export type { OwnerApprovalReceipt, Receipt } from "./receipts.ts";

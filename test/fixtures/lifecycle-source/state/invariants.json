@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "invariants": [
+    {
+      "id": "invariant:src1",
+      "cluster": "memory-system",
+      "rule": "Never substitute headless when observable is requested",
+      "source_incident_id": "incident:s3",
+      "approval_ref": "receipt:owner-1",
+      "status": "active"
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+{"id": "chronicle:m1", "task_id": "task:11111111-aaaa", "cluster": "memory-system", "stage": "decision", "summary": "Layers as modules", "provenance_refs": ["checkpoint:a2"], "recorded_at": "2026-09-22T10:00:00.000Z"}
+{"id": "chronicle:m2", "task_id": "task:33333333-cccc", "cluster": "memory-system", "stage": "outcome", "summary": "Closed experiment", "provenance_refs": [], "recorded_at": "2026-09-23T10:00:00.000Z"}
