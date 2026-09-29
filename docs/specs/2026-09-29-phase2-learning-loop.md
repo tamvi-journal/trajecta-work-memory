@@ -38,7 +38,7 @@ Returns `blockers` from the profile's **opt-in** guards (`observable-no-headless
 
 ## Import
 
-`import-awm` / `import-lwm` now bring incidents, friction and chronicle (tiers recomputed, provenance `source:<awm|lwm>:<id>`). Source **invariants are not activated**: they are listed in `learning.invariantsPendingReapproval` with the matching imported incident, for the owner to re-approve. Chronicle of tasks that were archived (closed in source) is skipped and reported.
+`import-awm` / `import-lwm` now bring incidents, friction and chronicle (tiers recomputed, provenance `source:<awm|lwm>:<id>`). Source **invariants are not activated**: they are listed in `learning.invariantsPendingReapproval` with the matching imported incident, for the owner to re-approve. Chronicle of tasks that were archived (closed in source) is skipped and reported. Friction imported by a release before friction kept provenance is replayed as recorded (the journal is append-only) and listed in `learning.frictionWithoutProvenance`, never skipped or duplicated.
 
 ## MCP (0.4.0)
 
