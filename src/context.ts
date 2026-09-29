@@ -119,6 +119,7 @@ export function workContext(
       next_action: item.nextAction,
       last_surface: item.lastSurface,
       updated_at: item.updatedAt,
+      ...(item.pendingHandoff ? { pending_handoff: { from_actor: item.pendingHandoff.fromActor, to_actor: item.pendingHandoff.toActor, to_surface: item.pendingHandoff.toSurfaceKind, revision: item.pendingHandoff.revision } } : {}),
     },
     active_branch: branch ? { id: branch.id, label: branch.label, purpose: branch.purpose, return_point: branch.returnPoint } : null,
     contract_anchor: anchor ? { id: anchor.id, version: anchor.contractVersion, summary: anchor.summary, provenance: anchor.provenance, created_at: anchor.createdAt } : null,

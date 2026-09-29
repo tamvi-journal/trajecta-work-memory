@@ -316,7 +316,7 @@ test("MCP: Phase 3 tools stamp the server surface, and none issues a receipt", (
   const own = call("work_skill_validate", { skill_id: "observable", version_id: "v1", outcome: "accepted", baseline_score: 0.1, candidate_score: 0.9, evidence_refs: ["test:x"], reason: "r" });
   assert.equal(own.isError, true, "the proposing session cannot accept its own version");
   const tools = (server.handle({ jsonrpc: "2.0", id: 2, method: "tools/list" }) as any).result.tools.map((tool: { name: string }) => tool.name);
-  assert.equal(tools.length, 30);
+  assert.equal(tools.length, 32);
   assert.ok(!tools.some((name: string) => /approve|issue|receipt/.test(name)));
 });
 

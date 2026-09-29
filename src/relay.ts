@@ -18,6 +18,8 @@ export interface HandoffInput {
   cue: string;
   maxBytes?: number;
   claimEpoch?: number;
+  /** Exchange: the exact recipient actor. With an actor, the target may be the same surface kind. */
+  targetActor?: string;
 }
 
 export class TrajectaRelay {
@@ -29,7 +31,7 @@ export class TrajectaRelay {
   }
 
   handoff(input: HandoffInput) {
-    if (input.target === this.surface.kind) throw new Error("A handoff target must be a different surface kind");
+    if (input.target === this.surface.kind && input.targetActor === undefined) throw new Error("A handoff target must be a different surface kind");
     const captured = this.store.capture({
       operationId: input.operationId,
       workId: input.workId,
@@ -41,9 +43,12 @@ export class TrajectaRelay {
       openLoops: input.openLoops,
       nextAction: input.nextAction,
       targetSurface: input.target,
+      ...(input.targetActor !== undefined ? { targetActor: input.targetActor } : {}),
       ...(input.claimEpoch !== undefined ? { claimEpoch: input.claimEpoch } : {}),
     });
-    const packet = this.store.transfer(input.workId, input.cue, input.target, input.maxBytes);
+    // Render from the exact snapshot the handoff commit returned, never from
+    // live state: a recipient may resume between the commit and this line.
+    const packet = this.store.transferFrom(captured.work, input.cue, input.target, input.maxBytes);
     const receipt: TransportReceipt = { level: "packet-created", reference: packet.packetId };
     return { packet, receipt, work: captured.work };
   }
@@ -51,6 +56,7 @@ export class TrajectaRelay {
   accept(packet: TransferPacket, operationId: string, instruction?: string, claimEpoch?: number) {
     if (packet.schema !== "trajecta.transfer/v1") throw new Error("Unsupported transfer packet schema");
     if (packet.intendedFor !== this.surface.kind) throw new Error("Transfer packet is intended for a different surface kind");
+    if (packet.intendedActor !== undefined && packet.intendedActor !== this.surface.actor) throw new Error(`Transfer packet is intended for ${packet.intendedActor}`);
     const resumed = this.store.resume({
       operationId,
       workId: packet.work.id,
