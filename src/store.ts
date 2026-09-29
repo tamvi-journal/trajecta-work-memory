@@ -741,6 +741,7 @@ export class TrajectaStore {
         this.recoverPending();
         const found = this.readState().work.find((item) => item.id === input.workId);
         if (found) this.admitted(found, input.surface, "close", input.claimEpoch);
+        if (found?.pendingHandoff) throw new HandoffInTransit(found.pendingHandoff, "close is refused until it is resumed or cancelled");
       }
       return null;
     });
@@ -819,16 +820,26 @@ export class TrajectaStore {
   }
 
   transfer(workId: string, cue: string, intendedFor: "cloud" | "local", maxBytes = 6_000, includeContract = false): TransferPacket {
+    return this.transferFrom(this.getWork(workId), cue, intendedFor, maxBytes, includeContract);
+  }
+
+  /**
+   * Render a packet from one exact work item snapshot, e.g. the one a
+   * handoff commit returned, using only history up to its revision. Later
+   * changes (a fast resume by the recipient) never alter the packet: it keeps
+   * the handoff's recipient and revision, and a stale one fails CAS on accept.
+   */
+  transferFrom(snapshot: WorkItem, cue: string, intendedFor: "cloud" | "local", maxBytes = 6_000, includeContract = false): TransferPacket {
     if (maxBytes < 900) throw new Error("Transfer budget must be at least 900 bytes");
-    const work = this.getWork(workId);
+    const work = structuredClone(snapshot);
+    const workId = work.id;
     if (work.pendingHandoff && intendedFor !== work.pendingHandoff.toSurfaceKind) {
       throw new HandoffInTransit(work.pendingHandoff, `a packet can only be made for ${work.pendingHandoff.toSurfaceKind}`);
     }
     const activeBranch = work.branches.find((branch) => branch.id === work.activeBranchId) ?? null;
-    const deltas = readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.kind !== "contract_anchor");
-    const latestAnchor = includeContract
-      ? readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.kind === "contract_anchor").at(-1)
-      : undefined;
+    const history = readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.revision <= work.revision);
+    const deltas = history.filter((item) => item.kind !== "contract_anchor");
+    const latestAnchor = includeContract ? history.filter((item) => item.kind === "contract_anchor").at(-1) : undefined;
     const packetBase = {
       schema: "trajecta.transfer/v1" as const,
       packetId: `packet:${crypto.randomUUID()}`,

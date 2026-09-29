@@ -33,7 +33,7 @@
   - `resume` only when `surface.actor === toActor` and `surface.kind === toSurfaceKind`. The resume commit clears `pendingHandoff`.
   - `capture` and `close` are refused for everyone, and a new handoff cannot be stacked on a pending one.
   - `handoff_cancel` (a new delta kind) is accepted only from `fromActor`. It clears `pendingHandoff` and sets the work back to active.
-- **Packets.** `transfer` refuses to render a packet for any surface kind other than `toSurfaceKind`. The packet carries `intendedActor`, and `accept` checks both `intendedFor` (kind) and `intendedActor`. Core and packet are equally strict.
+- **Packets.** `transfer` refuses to render a packet for any surface kind other than `toSurfaceKind`. The packet carries `intendedActor`, and `accept` checks both `intendedFor` (kind) and `intendedActor`. Core and packet are equally strict. `work_handoff` renders its packet from the exact work snapshot its handoff commit returned (`store.transferFrom`), with history only up to that revision, never from live state. So even if the recipient resumes before the sender renders, the packet keeps the handoff's recipient and revision; a stale packet then fails CAS on accept. A replayed handoff returns the same snapshot packet. `close` on a pending item is refused in the preflight, before the verifier runs.
 
 ## Claims in the exchange (E3): claim before resume
 

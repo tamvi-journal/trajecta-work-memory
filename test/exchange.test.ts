@@ -131,8 +131,35 @@ test("packets carry the exact recipient, and accept checks kind and actor", () =
   assert.equal(sent.packet.intendedActor, "lam");
   assert.throws(() => new TrajectaRelay(store, { ...auxLocal, session: "local:aux-2" }).accept(sent.packet, "operation:a1"), /intended for lam/);
   assert.equal(new TrajectaRelay(store, lamLocal).accept(sent.packet, "operation:a2").work.lastSurface.actor, "lam");
-  assert.throws(() => new TrajectaRelay(store, auxLocal).handoff({ operationId: "operation:h", workId: work.id, expectedRevision: 1, summary: "to lam", provenance: [], openLoops: [], nextAction: null, target: "local", cue: "c", targetActor: "lam" }),
-    /already resumed or cancelled/, "a replayed handoff never yields a packet without its recipient");
+  const replayed = new TrajectaRelay(store, auxLocal).handoff({ operationId: "operation:h", workId: work.id, expectedRevision: 1, summary: "to lam", provenance: [], openLoops: [], nextAction: null, target: "local", cue: "c", targetActor: "lam" });
+  assert.equal(replayed.packet.intendedActor, "lam", "a replayed handoff keeps its recipient");
+  assert.equal(replayed.packet.resume.expectedRevision, 2, "and its own revision");
+  assert.throws(() => new TrajectaRelay(store, lamLocal).accept(replayed.packet, "operation:a3"), /revision/i, "a stale packet fails CAS on accept");
+});
+
+test("the returned packet is the handoff commit's, even if the recipient resumes before it is rendered", () => {
+  const root = tmp();
+  const store = new TrajectaStore(root);
+  const recipient = new TrajectaStore(root);
+  const work = store.open({ operationId: "operation:open", topic: "Race", goal: "g", surface: auxLocal }).work;
+  store.capture({ operationId: "operation:c1", workId: work.id, expectedRevision: 1, surface: auxLocal, kind: "progress", summary: "before handoff" });
+  const capture = store.capture.bind(store);
+  store.capture = ((input: Parameters<typeof capture>[0]) => {
+    const result = capture(input);
+    if (input.kind === "handoff") {
+      // Another process: the recipient resumes and works before the sender renders its packet.
+      recipient.resume({ operationId: "operation:fast-resume", workId: work.id, expectedRevision: result.work.revision, surface: lamLocal });
+      recipient.capture({ operationId: "operation:after", workId: work.id, expectedRevision: result.work.revision + 1, surface: lamLocal, kind: "decision", summary: "later change" });
+    }
+    return result;
+  }) as typeof store.capture;
+  const sent = new TrajectaRelay(store, auxLocal).handoff({ operationId: "operation:h", workId: work.id, expectedRevision: 2, summary: "to lam", provenance: [], openLoops: [], nextAction: null, target: "local", cue: "c", targetActor: "lam" });
+  assert.equal(recipient.getWork(work.id).revision, 5, "the race really happened");
+  assert.equal(sent.packet.intendedActor, "lam");
+  assert.equal(sent.packet.resume.expectedRevision, 3);
+  assert.equal(sent.packet.work.revision, 3);
+  assert.ok(sent.packet.recentDeltas.every((delta) => delta.revision <= 3), "no history after the handoff commit");
+  assert.ok(!sent.packet.recentDeltas.some((delta) => delta.summary === "later change"));
 });
 
 test("startup: an exchange server must run as a registered actor on a registered surface; private stays actor-free", () => {
