@@ -15,7 +15,7 @@ import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
 import { clusterOf, type ClusterAssignment, type ClusterIndex, type CueRegistry, validateRegistry } from "./clusters.ts";
 import { GUARD_IDS, type GuardId } from "./learning.ts";
-import type { Surface } from "./types.ts";
+import type { Surface, SurfaceKind } from "./types.ts";
 
 export const PROFILE_FILE = "profile.json";
 
@@ -28,6 +28,48 @@ export interface WorkProfile {
   cueRegistry?: CueRegistry;
   /** Pre-action guards this profile turns on (see learning.ts GUARDS). */
   guards?: GuardId[];
+  /** Exchange: the registered actors. A server on this profile must run as one of them. */
+  actors?: ProfileActor[];
+  /** Exchange: who issues owner receipts (attribution only). */
+  owner?: string;
+  /** Exchange: capture/resume/close need a live claim; handoff/cancel need none. */
+  requireClaim?: boolean;
+}
+
+export interface ProfileActor {
+  id: string;
+  displayName?: string;
+  surfaces: SurfaceKind[];
+}
+
+const ACTOR_ID = /^[a-z][a-z0-9_-]{0,31}$/;
+
+function validateActors(value: unknown): ProfileActor[] {
+  if (!Array.isArray(value) || !value.length || value.length > 16) throw new Error("actors must be a list of 1..16 actors");
+  const seen = new Set<string>();
+  return value.map((item) => {
+    const actor = item as Partial<ProfileActor> | null;
+    if (!actor || typeof actor.id !== "string" || !ACTOR_ID.test(actor.id)) throw new Error("Each actor needs a lowercase id");
+    if (seen.has(actor.id)) throw new Error(`Duplicate actor ${actor.id}`);
+    seen.add(actor.id);
+    if (!Array.isArray(actor.surfaces) || !actor.surfaces.length || actor.surfaces.some((kind) => kind !== "cloud" && kind !== "local")) {
+      throw new Error(`Actor ${actor.id} needs surfaces: cloud and/or local`);
+    }
+    if (actor.displayName !== undefined && (typeof actor.displayName !== "string" || actor.displayName.length > 80)) throw new Error(`Actor ${actor.id} has an invalid displayName`);
+    return { id: actor.id, ...(actor.displayName ? { displayName: actor.displayName } : {}), surfaces: [...new Set(actor.surfaces)] as SurfaceKind[] };
+  });
+}
+
+/** Exchange profile: actors registered, the owner named, claims required. */
+export function exchangeProfile(actors: ProfileActor[], owner: string): WorkProfile {
+  return validateProfile({
+    ...defaultProfile(),
+    name: "exchange",
+    kernel: { id: "trajecta:kernel:exchange", version: "1", text: `${DEFAULT_KERNEL}\nThis is the shared exchange: only shared work lives here. Claim before you capture, resume or close; release before you hand off; hand off to one exact actor.` },
+    actors,
+    owner,
+    requireClaim: true,
+  });
 }
 
 const DEFAULT_KERNEL = [
@@ -72,6 +114,9 @@ export function validateProfile(value: unknown): WorkProfile {
     capabilityTtlHours: ttl,
     ...(profile.cueRegistry ? { cueRegistry: validateRegistry(profile.cueRegistry) } : {}),
     ...(profile.guards ? { guards: validateGuards(profile.guards) } : {}),
+    ...(profile.actors !== undefined ? { actors: validateActors(profile.actors) } : {}),
+    ...(profile.owner !== undefined ? { owner: (() => { if (typeof profile.owner !== "string" || !ACTOR_ID.test(profile.owner)) throw new Error("owner must be a lowercase id"); return profile.owner; })() } : {}),
+    ...(profile.requireClaim !== undefined ? { requireClaim: (() => { if (typeof profile.requireClaim !== "boolean") throw new Error("requireClaim must be true or false"); return profile.requireClaim; })() } : {}),
   };
 }
 

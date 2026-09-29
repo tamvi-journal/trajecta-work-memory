@@ -285,6 +285,8 @@ A delta MUST contain enough information for deterministic replay of the fields i
 
 Delta kind `close` (terminal `complete` / `abandoned`, bound to a typed `work_close` receipt) was added to the delta log. State schema backward compatibility is preserved (`state.json` stays `trajecta.state/v1`); **historical delta-log readers prior to close support are not forward-compatible** and reject a log that contains a `close` delta. This is a declared delta-log capability bump, not a silent one.
 
+Delta kind `handoff_cancel` and the optional `targetActor` field (exchange profile, 2026-09-29) are a second declared bump of the same kind: readers without exchange support reject a log containing `handoff_cancel`. `WorkItem.pendingHandoff` and `Surface.actor` are additive optional state fields; `state.json` stays `trajecta.state/v1`. See `docs/specs/2026-09-29-exchange-profile.md`.
+
 ### 7.2 Snapshotting
 
 The product MUST support periodic snapshots so replay cost does not grow without bound.

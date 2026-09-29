@@ -4,6 +4,18 @@ export interface Surface {
   kind: SurfaceKind;
   name: string;
   session: string;
+  /** Registered actor id, stamped by an exchange-profile server. Absent on private stores. */
+  actor?: string;
+}
+
+/** A handoff in transit to one exact recipient (exchange profile). Core state. */
+export interface PendingHandoff {
+  fromActor: string;
+  toActor: string;
+  toSurfaceKind: SurfaceKind;
+  handoffDeltaId: string;
+  revision: number;
+  createdAt: string;
 }
 
 export type WorkStatus = "active" | "waiting" | "blocked" | "complete" | "abandoned";
@@ -20,7 +32,8 @@ export type DeltaKind =
   | "synthesis"
   | "handoff"
   | "outcome"
-  | "contract_anchor";
+  | "contract_anchor"
+  | "handoff_cancel";
 
 export interface BranchInput {
   label: string;
@@ -49,6 +62,8 @@ export interface WorkItem {
   lastSurface: Surface;
   createdAt: string;
   updatedAt: string;
+  /** Set by an actor-addressed handoff, cleared by the recipient's resume or the sender's cancel. */
+  pendingHandoff?: PendingHandoff | null;
 }
 
 export interface Delta {
@@ -57,6 +72,8 @@ export interface Delta {
   workId: string;
   revision: number;
   kind: DeltaKind | "open" | "resume" | "close";
+  /** Recipient actor of an actor-addressed handoff. */
+  targetActor?: string;
   summary: string;
   surface: Surface;
   branchId: string | null;
@@ -89,6 +106,8 @@ export interface CaptureDeltaInput {
   openLoops?: string[];
   nextAction?: string | null;
   targetSurface?: SurfaceKind;
+  /** Exchange: the exact recipient actor of a handoff. */
+  targetActor?: string;
   /** Current claim epoch; required only while a live claim exists (claim fence). */
   claimEpoch?: number;
 }
@@ -106,8 +125,11 @@ export interface ResumeWorkInput {
 export interface AdmitContext {
   workId: string;
   surface: Surface;
-  kind: "capture" | "resume" | "close";
+  /** capture = any ordinary capture kind; handoff / handoff_cancel are named so the fence can treat them apart. */
+  kind: "capture" | "handoff" | "handoff_cancel" | "resume" | "close";
   claimEpoch?: number;
+  /** The work item's pending handoff on settled state, if any. */
+  pendingHandoff: PendingHandoff | null;
 }
 
 export interface TransferPacket {
@@ -117,6 +139,8 @@ export interface TransferPacket {
   cue: string;
   from: Surface;
   intendedFor: SurfaceKind;
+  /** Exchange: the exact recipient actor while a handoff is pending. */
+  intendedActor?: string;
   work: {
     id: string;
     topic: string;

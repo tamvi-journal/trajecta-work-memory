@@ -75,7 +75,8 @@ export class ClaimConflict extends Error {
   }
 }
 
-const sameHolder = (left: Surface, right: Surface) => left.kind === right.kind && left.name === right.name && left.session === right.session;
+const sameHolder = (left: Surface, right: Surface) =>
+  left.kind === right.kind && left.name === right.name && left.session === right.session && (left.actor ?? null) === (right.actor ?? null);
 
 function liveAt(entry: { live: LiveClaim | null } | undefined, now: Date) {
   const live = entry?.live;
@@ -97,7 +98,7 @@ export class ClaimLayer {
 
   constructor(store: TrajectaStore, options: ClaimOptions = {}) {
     this.store = store;
-    this.clock = options.clock ?? (() => new Date());
+    this.clock = options.clock ?? (() => store.now());
     this.options = options;
     this.journal = new DomainJournal(store.root, CLAIMS, this.clock, undefined, options.lock);
   }
@@ -126,6 +127,12 @@ export class ClaimLayer {
       // after its reservation), so a claim is only granted on settled state.
       const work = this.store.getWorkSettledHeld(input.workId);
       if (["complete", "abandoned"].includes(work.status)) throw new Error("Closed work cannot be claimed");
+      // A work item in transit can be claimed only by its exact recipient
+      // (claim before resume: nobody else can slip in between).
+      const pending = work.pendingHandoff;
+      if (pending && (input.surface.actor !== pending.toActor || input.surface.kind !== pending.toSurfaceKind)) {
+        throw new ClaimConflict(`Work is handed off to ${pending.toActor} (${pending.toSurfaceKind}); only that recipient can claim it`);
+      }
       return { ...this.journal.appendHeld(operationId, request, (index) => {
         const now = this.clock();
         const entry = own(index.byWork, work.id);
@@ -161,11 +168,22 @@ export class ClaimLayer {
  * The store's admission check for claims. Pure: reads the claims projection
  * under the root lock the store already holds and never writes a claim.
  */
-export function claimFence(root: string, options: { clock?: () => Date; lock?: LockOptions } = {}) {
+export function claimFence(root: string, options: { clock?: () => Date; lock?: LockOptions; requireClaim?: boolean } = {}) {
   const journal = new DomainJournal(root, CLAIMS, options.clock, undefined, options.lock);
   const clock = options.clock ?? (() => new Date());
   return (context: AdmitContext) => {
     const live = liveAt(own(journal.readHeld().byWork, context.workId), clock());
+    if (options.requireClaim) {
+      // Exchange policy: handoff and cancel happen only with no live claim
+      // (the sender releases first; a recipient's claim blocks a cancel).
+      if (context.kind === "handoff" || context.kind === "handoff_cancel") {
+        if (live) throw new ClaimConflict(`${context.kind} needs no live claim; ${live.holder.kind}:${live.holder.name} holds epoch ${live.epoch} until ${live.expiresAt}${sameHolder(live.holder, context.surface) ? " (release it first)" : ""}`);
+        if (context.claimEpoch !== undefined) throw new ClaimConflict(`${context.kind} takes no claim_epoch`);
+        return;
+      }
+      // capture, resume and close need the caller's own live claim.
+      if (!live) throw new ClaimConflict(`Claim this work first (work_claim); ${context.kind} needs a live claim in this store`);
+    }
     if (!live) {
       if (context.claimEpoch !== undefined) throw new ClaimConflict(`claim_epoch ${context.claimEpoch} given, but the work has no live claim (released or expired)`);
       return;

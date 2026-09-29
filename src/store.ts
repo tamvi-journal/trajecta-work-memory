@@ -9,6 +9,7 @@ import type {
   CaptureDeltaInput,
   Delta,
   OpenWorkInput,
+  PendingHandoff,
   ResumeWorkInput,
   RouteMatch,
   Surface,
@@ -55,6 +56,16 @@ export class RevisionConflict extends Error {
   }
 }
 
+/** A work item is in transit to one exact recipient (exchange profile). */
+export class HandoffInTransit extends Error {
+  readonly pending: PendingHandoff;
+  constructor(pending: PendingHandoff, detail: string) {
+    super(`Work is handed off from ${pending.fromActor} to ${pending.toActor} (${pending.toSurfaceKind}); ${detail}`);
+    this.name = "HandoffInTransit";
+    this.pending = pending;
+  }
+}
+
 export class OperationConflict extends Error {
   constructor() {
     super("Operation ID was reused with different input");
@@ -84,6 +95,7 @@ function assertSurface(surface: Surface) {
   if (!surface || !["cloud", "local"].includes(surface.kind)) throw new Error("Surface kind must be cloud or local");
   assertText(surface.name, "Surface name", 120);
   assertText(surface.session, "Surface session", 200);
+  if (surface.actor !== undefined) assertText(surface.actor, "Surface actor", 64);
 }
 
 function canonicalStoreJson(value: unknown, stack = new Set<object>()): string {
@@ -161,7 +173,16 @@ function isSurface(value: unknown): value is Surface {
   return Boolean(surface)
     && (surface.kind === "cloud" || surface.kind === "local")
     && typeof surface.name === "string"
-    && typeof surface.session === "string";
+    && typeof surface.session === "string"
+    && (surface.actor === undefined || typeof surface.actor === "string");
+}
+
+function isPendingHandoff(value: unknown): value is PendingHandoff {
+  const pending = value as Partial<PendingHandoff> | null;
+  return Boolean(pending)
+    && typeof pending!.fromActor === "string" && typeof pending!.toActor === "string"
+    && (pending!.toSurfaceKind === "cloud" || pending!.toSurfaceKind === "local")
+    && typeof pending!.handoffDeltaId === "string" && Number.isInteger(pending!.revision) && typeof pending!.createdAt === "string";
 }
 
 function isDelta(value: unknown): value is Delta {
@@ -171,7 +192,8 @@ function isDelta(value: unknown): value is Delta {
     && typeof delta.operationId === "string"
     && typeof delta.workId === "string"
     && Number.isInteger(delta.revision) && delta.revision > 0
-    && ["instruction", "decision", "progress", "blocker", "correction", "next_action", "branch_open", "branch_park", "synthesis", "handoff", "outcome", "contract_anchor", "open", "resume", "close"].includes(delta.kind as string)
+    && ["instruction", "decision", "progress", "blocker", "correction", "next_action", "branch_open", "branch_park", "synthesis", "handoff", "outcome", "contract_anchor", "open", "resume", "close", "handoff_cancel"].includes(delta.kind as string)
+    && (delta.targetActor === undefined || typeof delta.targetActor === "string")
     && typeof delta.summary === "string"
     && isSurface(delta.surface)
     && (typeof delta.branchId === "string" || delta.branchId === null)
@@ -210,7 +232,8 @@ function isWorkItem(value: unknown): value is WorkItem {
     && (typeof work.nextAction === "string" || work.nextAction === null)
     && isSurface(work.lastSurface)
     && typeof work.createdAt === "string"
-    && typeof work.updatedAt === "string";
+    && typeof work.updatedAt === "string"
+    && (work.pendingHandoff === undefined || work.pendingHandoff === null || isPendingHandoff(work.pendingHandoff));
 }
 
 function isStateFile(value: unknown): value is StateFile {
@@ -379,6 +402,11 @@ export class TrajectaStore {
     this.admit = options.admit;
   }
 
+  /** The store's clock (layers built on this store default to it). */
+  now() {
+    return this.clock();
+  }
+
   /** True when this store runs an admission check (the claim fence) on work mutations. */
   get admits() {
     return Boolean(this.admit);
@@ -389,8 +417,8 @@ export class TrajectaStore {
    * the root lock after replay, recovery and re-reading state, before CAS.
    * Must be a pure check (see docs/specs/2026-09-29-phase3-cases-skills-claims.md §C).
    */
-  private admitted(workId: string, surface: Surface, kind: AdmitContext["kind"], claimEpoch: number | undefined) {
-    this.admit?.({ workId, surface: structuredClone(surface), kind, claimEpoch });
+  private admitted(work: WorkItem, surface: Surface, kind: AdmitContext["kind"], claimEpoch: number | undefined) {
+    this.admit?.({ workId: work.id, surface: structuredClone(surface), kind, claimEpoch, pendingHandoff: work.pendingHandoff ? structuredClone(work.pendingHandoff) : null });
   }
 
   /** Run one mutation under the root write lock (see lock.ts). */
@@ -558,9 +586,25 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
-    this.admitted(current.id, input.surface, "capture", input.claimEpoch);
+    const admitKind = input.kind === "handoff" || input.kind === "handoff_cancel" ? input.kind : "capture";
+    this.admitted(current, input.surface, admitKind, input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Terminal work cannot accept new deltas");
+    // Exchange: a work item in transit accepts only the sender's cancel.
+    const pending = current.pendingHandoff ?? null;
+    if (input.kind === "handoff_cancel") {
+      if (!pending) throw new Error("No handoff is pending on this work item");
+      if (!input.surface.actor || input.surface.actor !== pending.fromActor) throw new HandoffInTransit(pending, "only the sender can cancel it");
+    } else if (pending) {
+      throw new HandoffInTransit(pending, `${input.kind} is refused until ${pending.toActor} resumes or ${pending.fromActor} cancels`);
+    }
+    if (input.targetActor !== undefined) {
+      if (input.kind !== "handoff") throw new Error("targetActor applies only to a handoff");
+      if (!input.surface.actor) throw new Error("An actor-addressed handoff needs a sender actor");
+      assertText(input.targetActor, "Target actor", 64);
+      if (input.targetActor === input.surface.actor) throw new Error("A handoff must go to another actor");
+      if (input.targetSurface !== "cloud" && input.targetSurface !== "local") throw new Error("An actor-addressed handoff needs its target surface kind");
+    }
     if (input.kind === "contract_anchor" && !(input.provenance?.length)) throw new Error("Contract anchors require provenance");
     if (input.kind === "outcome" && (input.openLoops === undefined || !("nextAction" in input) || !(input.provenance?.length))) {
       throw new Error("Outcome requires provenance, openLoops, and nextAction");
@@ -588,6 +632,7 @@ export class TrajectaStore {
     if (input.kind === "blocker") next.status = "blocked";
     else if (input.kind === "outcome" || input.kind === "handoff") next.status = "waiting";
     else next.status = "active";
+    if (input.kind === "handoff_cancel") next.pendingHandoff = null;
     next.revision = revision;
     next.updatedAt = now;
     next.lastSurface = structuredClone(input.surface);
@@ -608,6 +653,7 @@ export class TrajectaStore {
       surface: structuredClone(input.surface),
       branchId: branchId ?? null,
       targetSurface: input.targetSurface ?? null,
+      ...(input.targetActor !== undefined ? { targetActor: input.targetActor } : {}),
       provenance: [...(input.provenance ?? [])],
       createdAt: now,
       ...(input.kind === "contract_anchor" ? {
@@ -615,6 +661,13 @@ export class TrajectaStore {
         previousContractId: previousAnchor?.id ?? null,
       } : {}),
     };
+    if (input.targetActor !== undefined) {
+      // Bound in the same commit as the handoff delta: no crash window.
+      next.pendingHandoff = {
+        fromActor: input.surface.actor!, toActor: input.targetActor, toSurfaceKind: input.targetSurface!,
+        handoffDeltaId: delta.id, revision, createdAt: now,
+      };
+    }
     state.work[index] = next;
     return this.commit(beforeState, state, delta, input);
   }
@@ -633,9 +686,13 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
-    this.admitted(current.id, input.surface, "resume", input.claimEpoch);
+    this.admitted(current, input.surface, "resume", input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Terminal work cannot be resumed");
+    const pending = current.pendingHandoff ?? null;
+    if (pending && (input.surface.actor !== pending.toActor || input.surface.kind !== pending.toSurfaceKind)) {
+      throw new HandoffInTransit(pending, `only ${pending.toActor} on ${pending.toSurfaceKind} can resume it`);
+    }
     const now = this.clock().toISOString();
     const next = structuredClone(current);
     next.revision += 1;
@@ -643,6 +700,7 @@ export class TrajectaStore {
     next.lastSurface = structuredClone(input.surface);
     next.updatedAt = now;
     if (input.instruction) next.instruction = input.instruction.trim();
+    if (pending) next.pendingHandoff = null;
     const delta: Delta = {
       id: `delta:${crypto.randomUUID()}`,
       operationId: input.operationId,
@@ -681,7 +739,8 @@ export class TrajectaStore {
       // verifier. Stage 3 checks it again: the claim can change meanwhile.
       if (this.admit) {
         this.recoverPending();
-        if (this.readState().work.some((item) => item.id === input.workId)) this.admitted(input.workId, input.surface, "close", input.claimEpoch);
+        const found = this.readState().work.find((item) => item.id === input.workId);
+        if (found) this.admitted(found, input.surface, "close", input.claimEpoch);
       }
       return null;
     });
@@ -710,9 +769,10 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
-    this.admitted(current.id, input.surface, "close", input.claimEpoch);
+    this.admitted(current, input.surface, "close", input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Work is already closed");
+    if (current.pendingHandoff) throw new HandoffInTransit(current.pendingHandoff, "close is refused until it is resumed or cancelled");
     if (input.status === "complete" && current.openLoops.length) {
       throw new Error(`Cannot close as complete with ${current.openLoops.length} open loop(s); resolve them first`);
     }
@@ -761,6 +821,9 @@ export class TrajectaStore {
   transfer(workId: string, cue: string, intendedFor: "cloud" | "local", maxBytes = 6_000, includeContract = false): TransferPacket {
     if (maxBytes < 900) throw new Error("Transfer budget must be at least 900 bytes");
     const work = this.getWork(workId);
+    if (work.pendingHandoff && intendedFor !== work.pendingHandoff.toSurfaceKind) {
+      throw new HandoffInTransit(work.pendingHandoff, `a packet can only be made for ${work.pendingHandoff.toSurfaceKind}`);
+    }
     const activeBranch = work.branches.find((branch) => branch.id === work.activeBranchId) ?? null;
     const deltas = readJsonl<Delta>(this.deltaFile, "deltas").filter((item) => item.workId === workId && item.kind !== "contract_anchor");
     const latestAnchor = includeContract
@@ -773,6 +836,7 @@ export class TrajectaStore {
       cue,
       from: structuredClone(work.lastSurface),
       intendedFor,
+      ...(work.pendingHandoff ? { intendedActor: work.pendingHandoff.toActor } : {}),
       work: {
         id: work.id,
         topic: work.topic,

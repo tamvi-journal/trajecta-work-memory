@@ -7,6 +7,10 @@ import { INCIDENTS } from "./learning.ts";
 import { DomainJournal } from "./journal.ts";
 import { invariantDigest, issueReceipt, newReceiptId, receiptJournal, type OwnerApprovalReceipt, type SkillActivationReceipt, type SkillRollbackReceipt } from "./receipts.ts";
 import { SkillLayer } from "./skills.ts";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { exchangeProfile, PROFILE_FILE, validateProfile, type ProfileActor } from "./boot.ts";
 import { own } from "./clusters.ts";
 import type { WorkCloseReceipt } from "./types.ts";
 
@@ -56,6 +60,9 @@ Commands:
   import-awm <source-root>
   import-lwm <source-root>
   receipts                                  list issued receipts
+  exchange-init <root> --actors aux:cloud+local,lam:local --owner ty
+      Write the exchange profile (registered actors, owner, claims required)
+      into <root> and print the MCP server entry each agent adds.
 
 Owner approvals (run these yourself; agents cannot issue receipts over MCP):
   approve-promotion <incident-id> [--expires-hours N] [--provenance a:b,c:d]
@@ -76,7 +83,7 @@ Owner approvals (run these yourself; agents cannot issue receipts over MCP):
 try {
   // Only the approval commands take --options; every other command keeps its
   // arguments verbatim (a cue may well contain "--").
-  const { positional: args, named } = command?.startsWith("approve-") ? flags(rest) : { positional: rest, named: {} as Record<string, string> };
+  const { positional: args, named } = command?.startsWith("approve-") || command === "exchange-init" ? flags(rest) : { positional: rest, named: {} as Record<string, string> };
   if (command === "list") print(store.list());
   else if (command === "route") print(store.route(args.join(" ")));
   else if (command === "packet") {
@@ -146,6 +153,36 @@ try {
     print({
       verification_ref: receipt.id, work_id: workId, expected_revision: work.revision, status, summary: named.summary.trim(), provenance,
       next: "The agent must call work_close with exactly this revision, status, summary and provenance.",
+    });
+  } else if (command === "exchange-init") {
+    const [target] = args;
+    if (!target || !named.actors || !named.owner) throw new Error("Usage: trajecta exchange-init <root> --actors aux:cloud+local,lam:local --owner ty");
+    const actors: ProfileActor[] = named.actors.split(",").map((entry) => {
+      const [id, kinds = ""] = entry.trim().split(":");
+      return { id, surfaces: kinds.split("+").filter(Boolean) as ProfileActor["surfaces"] };
+    });
+    const profile = exchangeProfile(actors, named.owner);
+    const exchangeRoot = path.resolve(target);
+    const file = path.join(exchangeRoot, PROFILE_FILE);
+    if (fs.existsSync(file)) {
+      const existing = validateProfile(JSON.parse(fs.readFileSync(file, "utf8")));
+      if (JSON.stringify(existing) !== JSON.stringify(profile)) throw new Error(`${file} already holds a different profile; edit or remove it yourself`);
+    } else {
+      fs.mkdirSync(exchangeRoot, { recursive: true });
+      fs.writeFileSync(file, `${JSON.stringify(profile, null, 2)}\n`);
+    }
+    const server = path.join(path.dirname(fileURLToPath(import.meta.url)), "mcp-server.ts");
+    const entries = actors.flatMap((actor) => actor.surfaces.map((kind) => [`${actor.id}@${kind}`, {
+      "trajecta-exchange": {
+        command: "node",
+        args: ["--experimental-strip-types", "--no-warnings", server],
+        env: { TRAJECTA_HOME: exchangeRoot, TRAJECTA_ACTOR: actor.id, TRAJECTA_SURFACE_KIND: kind, TRAJECTA_SURFACE_NAME: actor.displayName ?? actor.id, TRAJECTA_SURFACE_SESSION: `${kind}:${actor.id}` },
+      },
+    }]));
+    print({
+      profile: file, actors: profile.actors, owner: profile.owner, requireClaim: profile.requireClaim,
+      mcpServers: Object.fromEntries(entries),
+      note: "Each agent adds its entry next to its private work-memory server. The private server stays unchanged.",
     });
   } else if (command === "approve-skill") {
     const [skillId, versionId, decisionId] = args;

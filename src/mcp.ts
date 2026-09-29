@@ -8,7 +8,7 @@
 import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { RevisionConflict, TrajectaStore } from "./store.ts";
+import { HandoffInTransit, RevisionConflict, TrajectaStore } from "./store.ts";
 import { TrajectaRelay } from "./relay.ts";
 import { bootstrap, CAPABILITY_SNAPSHOTS, loadProfile, type WorkProfile } from "./boot.ts";
 import { CLUSTER_ID, clusterJournal, hasCluster, routeClusters } from "./clusters.ts";
@@ -23,7 +23,7 @@ import { claimFence, ClaimLayer } from "./claims.ts";
 import type { DeltaKind, Surface, SurfaceKind } from "./types.ts";
 
 export const SERVER_NAME = "trajecta-work-memory";
-export const SERVER_VERSION = "0.5.0";
+export const SERVER_VERSION = "0.6.0";
 const CAPTURE_KINDS: DeltaKind[] = [
   "instruction", "decision", "progress", "blocker", "correction", "next_action",
   "branch_open", "branch_park", "synthesis", "outcome", "contract_anchor",
@@ -40,14 +40,34 @@ export function defaultRoot(env: NodeJS.ProcessEnv = process.env, platform = pro
   return path.join(env.XDG_DATA_HOME || path.join(home, ".local", "share"), "trajecta-work-memory");
 }
 
-export function surfaceFrom(env: NodeJS.ProcessEnv = process.env): Surface {
+export function surfaceFrom(env: NodeJS.ProcessEnv = process.env, profile?: WorkProfile): Surface {
   const kind = (env.TRAJECTA_SURFACE_KIND || "local") as SurfaceKind;
   if (kind !== "cloud" && kind !== "local") throw new Error("TRAJECTA_SURFACE_KIND must be cloud or local");
-  return {
+  const surface: Surface = {
     kind,
     name: env.TRAJECTA_SURFACE_NAME || (kind === "local" ? "Local agent" : "Cloud agent"),
     session: env.TRAJECTA_SURFACE_SESSION || `${kind}:mcp`,
   };
+  const actor = env.TRAJECTA_ACTOR?.trim();
+  if (profile?.actors) {
+    if (!actor) throw new Error(`Profile ${profile.name} has actors; set TRAJECTA_ACTOR to one of: ${profile.actors.map((item) => item.id).join(", ")}`);
+    surface.actor = actor;
+    assertActor(surface, profile);
+  } else if (actor) {
+    throw new Error(`TRAJECTA_ACTOR is set but profile ${profile?.name ?? "default"} has no actors`);
+  }
+  return surface;
+}
+
+/** An exchange server must run as a registered actor on one of its surfaces. */
+export function assertActor(surface: Surface, profile: WorkProfile) {
+  if (!profile.actors) {
+    if (surface.actor !== undefined) throw new Error(`Profile ${profile.name} has no actors; this surface must not carry one`);
+    return;
+  }
+  const registered = profile.actors.find((item) => item.id === surface.actor);
+  if (!registered) throw new Error(`Actor ${String(surface.actor)} is not registered in profile ${profile.name}`);
+  if (!registered.surfaces.includes(surface.kind)) throw new Error(`Actor ${registered.id} is not registered for the ${surface.kind} surface`);
 }
 
 const str = { type: "string" };
@@ -111,9 +131,15 @@ export const TOOLS = [
       provenance: strs,
       open_loops: strs,
       next_action: { type: ["string", "null"], maxLength: 1000 },
+      to_actor: { type: "string", maxLength: 64, description: "Exchange only (required there): the exact actor who may pick this up." },
+      to_surface: { type: "string", enum: ["cloud", "local"], description: "Exchange: the recipient's surface; defaults to its only registered surface." },
       claim_epoch: claimEpoch,
       operation_id: opId,
     }, ["work_id", "expected_revision", "summary", "cue"], W),
+  tool("work_handoff_cancel", "Exchange: cancel your own pending handoff (only the sender, and only while nobody holds a claim on it).",
+    { work_id: str, expected_revision: rev, summary: { type: "string", minLength: 1, maxLength: 1000 }, operation_id: opId },
+    ["work_id", "expected_revision", "summary"], W),
+  tool("work_inbox", "Exchange: work handed off to you. Claim it (work_claim), then resume it with your claim_epoch."),
   tool("work_resume", "Resume work on this surface at the expected revision.",
     { work_id: str, expected_revision: rev, instruction: { type: "string", maxLength: 1000 }, claim_epoch: claimEpoch, operation_id: opId },
     ["work_id", "expected_revision"], W),
@@ -222,12 +248,17 @@ export const TOOLS = [
     { skill_id: ident, mode: { type: "string", enum: ["normal", "audit"] } }, ["skill_id"]),
 ];
 
-function summarize(item: ReturnType<TrajectaStore["getWork"]>) {
+function summarize(item: ReturnType<TrajectaStore["getWork"]>, me?: Surface) {
   const branch = item.branches.find((candidate) => candidate.id === item.activeBranchId);
   return {
     id: item.id, topic: item.topic, goal: item.goal, status: item.status, revision: item.revision,
     next_action: item.nextAction, open_loops: item.openLoops, active_branch: branch?.label ?? null,
     last_surface: item.lastSurface, updated_at: item.updatedAt,
+    ...(item.pendingHandoff ? { pending_handoff: {
+      from_actor: item.pendingHandoff.fromActor, to_actor: item.pendingHandoff.toActor, to_surface: item.pendingHandoff.toSurfaceKind,
+      revision: item.pendingHandoff.revision, created_at: item.pendingHandoff.createdAt,
+      ...(me ? { for_me: item.pendingHandoff.toActor === me.actor && item.pendingHandoff.toSurfaceKind === me.kind } : {}),
+    } } : {}),
   };
 }
 
@@ -258,6 +289,11 @@ export class WorkServer {
     this.cases = new CaseLayer(store);
     this.skills = new SkillLayer(store.root, { resolveReceipt });
     this.claims = new ClaimLayer(store);
+    assertActor(surface, this.profile);
+  }
+
+  private sum(item: ReturnType<TrajectaStore["getWork"]>) {
+    return summarize(item, this.surface);
   }
 
   private epoch(args: Json) {
@@ -332,7 +368,7 @@ export class WorkServer {
           status: args.status as "complete" | "abandoned", summary: String(args.summary), verificationRef: String(args.verification_ref),
           provenance: (args.provenance as string[]) ?? [], ...this.epoch(args),
         });
-        return { work: summarize(closed.work), delta: { id: closed.delta.id, revision: closed.delta.revision } };
+        return { work: this.sum(closed.work), delta: { id: closed.delta.id, revision: closed.delta.revision } };
       }
       case "work_context":
         return workContext(s, this.clusters, {
@@ -420,8 +456,21 @@ export class WorkServer {
       }
       case "work_skill_get":
         return this.skills.getSkill(String(args.skill_id), (args.mode as "normal" | "audit" | undefined) ?? "normal");
+      case "work_handoff_cancel": {
+        if (!this.profile.actors) throw new Error("work_handoff_cancel applies only to an exchange profile with actors");
+        const cancelled = s.capture({
+          operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision),
+          surface: this.surface, kind: "handoff_cancel", summary: String(args.summary),
+        });
+        return { work: this.sum(cancelled.work), delta: { id: cancelled.delta.id, revision: cancelled.delta.revision } };
+      }
+      case "work_inbox": {
+        if (!this.profile.actors) return { work: [], note: "This profile has no actors; there is no inbox." };
+        const mine = s.list().filter((item) => item.pendingHandoff?.toActor === this.surface.actor && item.pendingHandoff?.toSurfaceKind === this.surface.kind);
+        return { work: mine.map((item) => this.sum(item)), next: "work_claim, then work_resume with claim_epoch and the expected revision." };
+      }
       case "work_list":
-        return { work: s.list().map(summarize) };
+        return { work: s.list().map((item) => this.sum(item)) };
       case "work_route":
         return { matches: s.route(String(args.cue), Number(args.limit ?? 3)) };
       case "work_get": {
@@ -430,7 +479,7 @@ export class WorkServer {
         const deltas = s.history(item.id).slice(-recent).map((d) => ({
           id: d.id, revision: d.revision, kind: d.kind, summary: d.summary, provenance: d.provenance, created_at: d.createdAt,
         }));
-        return { work: summarize(item), branches: item.branches, recent_deltas: recent ? deltas : [] };
+        return { work: this.sum(item), branches: item.branches, recent_deltas: recent ? deltas : [] };
       }
       case "work_open": {
         const opened = s.open({
@@ -438,7 +487,7 @@ export class WorkServer {
           instruction: typeof args.instruction === "string" ? args.instruction : undefined,
           initialBranch: branchInput(args.branch),
         });
-        return { work: summarize(opened.work) };
+        return { work: this.sum(opened.work) };
       }
       case "work_capture": {
         const captured = s.capture({
@@ -448,10 +497,24 @@ export class WorkServer {
           nextAction: args.next_action as string | null | undefined,
           branchId: args.branch_id as string | undefined, branch: branchInput(args.branch), ...this.epoch(args),
         });
-        return { work: summarize(captured.work), delta: { id: captured.delta.id, revision: captured.delta.revision } };
+        return { work: this.sum(captured.work), delta: { id: captured.delta.id, revision: captured.delta.revision } };
       }
       case "work_handoff": {
-        const target: SurfaceKind = this.surface.kind === "cloud" ? "local" : "cloud";
+        let target: SurfaceKind = this.surface.kind === "cloud" ? "local" : "cloud";
+        let targetActor: string | undefined;
+        if (this.profile.actors) {
+          const to = typeof args.to_actor === "string" ? args.to_actor : "";
+          const recipient = this.profile.actors.find((item) => item.id === to);
+          if (!recipient) throw new Error(`to_actor must be one of: ${this.profile.actors.map((item) => item.id).join(", ")}`);
+          if (recipient.id === this.surface.actor) throw new Error("A handoff must go to another actor");
+          const kind = args.to_surface as SurfaceKind | undefined;
+          if (kind !== undefined && !recipient.surfaces.includes(kind)) throw new Error(`${recipient.id} is not registered for the ${kind} surface`);
+          if (kind === undefined && recipient.surfaces.length > 1) throw new Error(`${recipient.id} has several surfaces; pass to_surface`);
+          target = kind ?? recipient.surfaces[0];
+          targetActor = recipient.id;
+        } else if (args.to_actor !== undefined || args.to_surface !== undefined) {
+          throw new Error("to_actor / to_surface apply only to an exchange profile with actors");
+        }
         const current = s.getWork(String(args.work_id));
         const result = new TrajectaRelay(s, this.surface).handoff({
           operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision),
@@ -460,15 +523,16 @@ export class WorkServer {
           openLoops: (args.open_loops as string[] | undefined) ?? current.openLoops,
           nextAction: args.next_action === undefined ? current.nextAction : (args.next_action as string | null),
           ...this.epoch(args),
+          ...(targetActor ? { targetActor } : {}),
         });
-        return { work: summarize(result.work), packet: result.packet, receipt: result.receipt };
+        return { work: this.sum(result.work), packet: result.packet, receipt: result.receipt };
       }
       case "work_resume": {
         const resumed = s.resume({
           operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision),
           surface: this.surface, instruction: typeof args.instruction === "string" ? args.instruction : undefined, ...this.epoch(args),
         });
-        return { work: summarize(resumed.work) };
+        return { work: this.sum(resumed.work) };
       }
       case "work_packet":
         return { packet: s.transfer(String(args.work_id), String(args.cue), args.target as SurfaceKind) };
@@ -500,7 +564,9 @@ export class WorkServer {
         const text = JSON.stringify(result);
         return ok({ content: [{ type: "text", text }], structuredContent: JSON.parse(text), isError: false });
       } catch (error) {
-        const message = error instanceof RevisionConflict
+        const message = error instanceof HandoffInTransit
+          ? `HandoffInTransit: ${error.message}`
+          : error instanceof RevisionConflict
           ? `${error.message}. Read the work again (work_get) and retry with revision ${error.latest.revision}.`
           : error instanceof UnsafeInput
             ? `${error.message}. Remove secrets and execution payloads from the arguments.`
@@ -516,8 +582,8 @@ export async function runStdio(env: NodeJS.ProcessEnv = process.env) {
   const root = defaultRoot(env);
   const profile = loadProfile(root, env.TRAJECTA_PROFILE?.trim() || undefined);
   const resolveReceipt = receiptResolver(root);
-  const store = new TrajectaStore(root, undefined, undefined, { resolveReceipt, admit: claimFence(root) });
-  const server = new WorkServer(store, surfaceFrom(env), { profile, resolveReceipt });
+  const store = new TrajectaStore(root, undefined, undefined, { resolveReceipt, admit: claimFence(root, { requireClaim: profile.requireClaim }) });
+  const server = new WorkServer(store, surfaceFrom(env, profile), { profile, resolveReceipt });
   process.stdin.setEncoding("utf8");
   let buffer = "";
   for await (const chunk of process.stdin) {
