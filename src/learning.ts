@@ -32,13 +32,13 @@ const tierFor = (count: number): Tier => (count <= 1 ? "raw" : count === 2 ? "re
 const REF = /^[a-z][a-z0-9-]*:[A-Za-z0-9][A-Za-z0-9._:/@-]*$/;
 const SLUG = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
-function text(value: unknown, label: string, max: number) {
+export function text(value: unknown, label: string, max: number) {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} is required`);
   if (value.length > max) throw new Error(`${label} exceeds ${max} characters`);
   return value.trim();
 }
 
-function refs(value: unknown, label: string, max = 20) {
+export function refs(value: unknown, label: string, max = 20) {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > max || value.some((item) => typeof item !== "string" || item.length > 200 || !REF.test(item))) {
     throw new Error(`${label} must be up to ${max} references like kind:id`);
@@ -46,12 +46,12 @@ function refs(value: unknown, label: string, max = 20) {
   return [...new Set(value as string[])];
 }
 
-function slug(value: unknown, label: string) {
+export function slug(value: unknown, label: string) {
   if (typeof value !== "string" || !SLUG.test(value)) throw new Error(`${label} must be a short lowercase slug`);
   return value;
 }
 
-function cluster(value: unknown) {
+export function cluster(value: unknown) {
   if (typeof value !== "string" || !CLUSTER_ID.test(value)) throw new Error("cluster must be a cluster id");
   return value;
 }

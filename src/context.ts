@@ -14,6 +14,8 @@ import type { TrajectaStore } from "./store.ts";
 import type { DomainJournal } from "./journal.ts";
 import { clusterOf, membersOf, type ClusterAssignment, type ClusterIndex } from "./clusters.ts";
 import type { LearningLayer } from "./learning.ts";
+import type { CaseLayer } from "./cases.ts";
+import type { SkillLayer } from "./skills.ts";
 import type { Delta } from "./types.ts";
 
 export type ContextMode = "normal" | "debug" | "audit";
@@ -71,6 +73,7 @@ export function workContext(
   clusters: DomainJournal<ClusterIndex, ClusterAssignment> | null,
   input: ContextInput,
   learning: LearningLayer | null = null,
+  investigation: { cases?: CaseLayer; skills?: SkillLayer } | null = null,
 ) {
   const budget = input.budgetChars ?? 6_000;
   if (!Number.isInteger(budget) || budget < 800 || budget > 60_000) throw new Error("budget_chars must be an integer in 800..60000");
@@ -141,6 +144,33 @@ export function workContext(
     })() : {}),
   } : {};
   Object.assign(base, learned);
+  // Investigation layer: linked cases and active skills in every mode;
+  // hypotheses in debug; full hypotheses and case events in audit. Skill
+  // candidates never appear here.
+  if (investigation?.skills) Object.assign(base, { active_skills: investigation.skills.activeFor(workCluster) });
+  if (investigation?.cases) {
+    const cases = investigation.cases.linkedCases(item.id);
+    Object.assign(base, {
+      linked_cases: cases.map(([caseId, record]) => ({
+        case_id: caseId, title: record.title, status: record.status, incident_ids: record.incidentIds,
+        resolution_hypothesis_ids: record.resolutionHypothesisIds,
+        ...(input.mode === "normal" ? {} : {
+          hypotheses: investigation.cases!.hypothesesOf(caseId).map(([hypothesisId, hypothesis]) => ({
+            id: hypothesisId, status: hypothesis.status, statement: hypothesis.statement, attestation: hypothesis.attestation,
+            ...(input.mode === "audit" ? {
+              verification_ref: hypothesis.verificationRef, supporting_refs: hypothesis.supportingRefs,
+              disconfirming_refs: hypothesis.disconfirmingRefs, author: hypothesis.author,
+            } : {}),
+          })),
+        }),
+      })),
+      ...(input.mode === "audit" ? {
+        case_events: investigation.cases.journal.events()
+          .filter((event) => event.type !== "hypothesis" && cases.some(([caseId]) => caseId === event.caseId))
+          .slice(-50),
+      } : {}),
+    });
+  }
   const { deltas: _none, ...fixed } = base;
   return fitList((kept, dropped) => ({ ...fixed, deltas: kept, budget: { chars: budget, used: 0, dropped } }), recent.map(compactDelta), budget, "start");
 }

@@ -79,10 +79,22 @@ dependencies:
 }
 ```
 
-Tools: `work_list`, `work_route`, `work_get`, `work_open`, `work_capture`,
-`work_handoff`, `work_resume`, `work_packet`. Every write carries the expected
-revision. A stale one is rejected, and the error says which revision to retry
-with.
+Core tools: `work_list`, `work_route`, `work_get`, `work_open`, `work_capture`,
+`work_handoff`, `work_resume`, `work_packet`, `work_close`, `work_context`,
+`work_bootstrap`. Every write carries the expected revision. A stale one is
+rejected, and the error says which revision to retry with.
+
+Layers on top: clusters (`work_route_clusters`, `work_assign_cluster`), the
+learning loop (`work_record_incident`, `work_record_friction`,
+`work_record_milestone`, `work_promote_incident`, `work_check_action`), debug
+cases (`work_case_open`, `work_case_event`, `work_hypothesis`, `work_case_get`),
+skill evolution (`work_skill_pattern`, `work_skill_propose`,
+`work_skill_validate`, `work_skill_activate`, `work_skill_rollback`,
+`work_skill_get`) and claims (`work_claim`, `work_release`).
+
+Anything that changes what agents are told to do, or ends work, needs a receipt
+the owner issues from the CLI: `trajecta approve-close`, `approve-promotion`,
+`approve-skill`, `approve-rollback`. No MCP tool can issue one.
 
 The store lives in `TRAJECTA_HOME`, or in the platform data folder by default
 (`~/Library/Application Support/Trajecta Work Memory` on macOS,

@@ -19,6 +19,8 @@ import { canonicalStoreDigest, OperationConflict, type TrajectaStore } from "./s
 import { clusterJournal, parseLegacyCueRegistry, type CueRegistry } from "./clusters.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
 import { CHRONICLE_STAGES, LearningLayer, type ChronicleStage } from "./learning.ts";
+import { CaseLayer } from "./cases.ts";
+import { SkillLayer, type ValidationOutcome } from "./skills.ts";
 import type { BranchInput, CaptureDeltaInput, DeltaKind, Surface, WorkItem } from "./types.ts";
 
 export type LifecycleSource = "awm" | "lwm";
@@ -145,6 +147,16 @@ export interface ImportReport {
     /** Source invariants are never activated on import; the owner re-approves them. */
     invariantsPendingReapproval: Array<{ sourceId: string; cluster: string; rule: string; sourceIncidentId: string | null; importedIncidentId: string | null }>;
   };
+  investigation: {
+    cases: number;
+    caseEvents: number;
+    hypotheses: number;
+    patternRevisions: number;
+    versions: number;
+    validations: number;
+    /** Source active pointers are never activated on import; the owner re-approves after a new eligible validation. */
+    skillsPendingReactivation: Array<{ skillId: string; versionId: string; sourceDecisionId: string | null }>;
+  };
 }
 
 export function sourceFiles(sourceRoot: string) {
@@ -157,6 +169,12 @@ export function sourceFiles(sourceRoot: string) {
     friction: path.join(state, "friction.jsonl"),
     chronicle: path.join(state, "chronicle.jsonl"),
     invariants: path.join(state, "invariants.json"),
+    caseEvents: path.join(state, "case-events.jsonl"),
+    caseHypotheses: path.join(state, "case-hypotheses.jsonl"),
+    skillPatterns: path.join(state, "skill-patterns.jsonl"),
+    skillVersions: path.join(state, "skill-versions.jsonl"),
+    skillValidations: path.join(state, "skill-validations.jsonl"),
+    skillPointers: path.join(state, "skill-active-pointers.json"),
   };
 }
 
@@ -172,6 +190,7 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
   const report: ImportReport = {
     schema: "trajecta.import-report/v1", source, sourceRoot: path.resolve(sourceRoot), sourceDigest, tasks: [], skipped: [], registry,
     learning: { incidents: 0, friction: 0, frictionWithoutProvenance: [], milestones: 0, invariantsPendingReapproval: [] },
+    investigation: { cases: 0, caseEvents: 0, hypotheses: 0, patternRevisions: 0, versions: 0, validations: 0, skillsPendingReactivation: [] },
   };
   const op = (kind: string, id: string) => `operation:import-${source}-${kind}-${short(id)}`;
 
@@ -310,7 +329,8 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
       },
     });
   }
-  importLearning(store, files, source, report, op);
+  const incidentIds = importLearning(store, files, source, report, op);
+  importInvestigation(store, files, source, report, op, incidentIds);
   return report;
 }
 
@@ -388,6 +408,129 @@ function importLearning(
         sourceId: String(item.id), cluster: String(item.cluster), rule: String(item.rule),
         sourceIncidentId: item.source_incident_id ?? null,
         importedIncidentId: item.source_incident_id ? incidentIds.get(item.source_incident_id) ?? null : null,
+      });
+    }
+  }
+  return incidentIds;
+}
+
+/**
+ * Cases, hypotheses and skill history come across as imported history:
+ * attestation `imported`, source id in provenance. An imported verdict never
+ * resolves a case locally, an imported validation never backs an activation,
+ * and source active pointers are only listed for the owner to re-approve.
+ */
+function importInvestigation(
+  store: TrajectaStore,
+  files: ReturnType<typeof sourceFiles>,
+  source: LifecycleSource,
+  report: ImportReport,
+  op: (kind: string, id: string) => string,
+  incidentIds: Map<string, string>,
+) {
+  const cases = new CaseLayer(store);
+  const skills = new SkillLayer(store.root);
+  const workFor = new Map(report.tasks.filter((task) => task.workId).map((task) => [task.sourceTaskId, task.workId as string]));
+  const surface = surfaceOf(`${source}-import`, "import");
+  const skip = (id: unknown, reason: string) => report.skipped.push({ eventId: String(id ?? "unknown"), reason });
+  const provenance = (id: string) => ({ provenance: [`source:${source}:${id}`] });
+  const sourceId = (item: Record<string, any>) => String(item.event_id ?? item.operation_id ?? item.id ?? "unknown");
+  const importedCases = new Set<string>();
+
+  for (const item of readJsonLines(files.caseEvents) as Array<Record<string, any>>) {
+    const id = sourceId(item);
+    try {
+      if (item.event_type === "open") {
+        const workIds = (item.task_ids ?? []).map((taskId: string) => workFor.get(taskId)).filter(Boolean) as string[];
+        if (!workIds.length) { skip(id, "case: none of its tasks was imported as live work"); continue; }
+        cases.recordCaseEvent(op("case", id), {
+          caseId: item.case_id, eventType: "open", title: item.title, workIds, signatures: item.signature_slugs ?? [],
+          evidenceRefs: item.evidence_refs ?? [], surface, imported: provenance(id),
+        });
+        importedCases.add(item.case_id);
+        report.investigation.cases += 1;
+        continue;
+      }
+      if (!importedCases.has(item.case_id)) { skip(id, "case: its case was not imported"); continue; }
+      if (item.event_type === "member_added" || item.event_type === "member_removed") {
+        const incidentId = incidentIds.get(item.incident_id);
+        if (!incidentId) { skip(id, "case: its incident was not imported"); continue; }
+        cases.recordCaseEvent(op("case", id), {
+          caseId: item.case_id, eventType: item.event_type, incidentId, evidenceRefs: item.evidence_refs ?? [], surface, imported: provenance(id),
+        });
+      } else {
+        cases.recordCaseEvent(op("case", id), {
+          caseId: item.case_id, eventType: "status", status: item.status, evidenceRefs: item.evidence_refs ?? [], surface, imported: provenance(id),
+        });
+      }
+      report.investigation.caseEvents += 1;
+    } catch (error) {
+      skip(id, `case: ${(error as Error).message}`);
+    }
+  }
+  for (const item of readJsonLines(files.caseHypotheses) as Array<Record<string, any>>) {
+    const id = sourceId(item);
+    if (!importedCases.has(item.case_id)) { skip(id, "hypothesis: its case was not imported"); continue; }
+    try {
+      cases.recordHypothesis(op("hypothesis", id), {
+        hypothesisId: item.hypothesis_id, caseId: item.case_id, status: item.status, statement: item.statement,
+        signature: item.signature_slug ?? null, supportingRefs: item.supporting_refs ?? [], disconfirmingRefs: item.disconfirming_refs ?? [],
+        discriminatingCheck: item.discriminating_check ?? null, verificationRef: item.verification_ref ?? null, surface, imported: provenance(id),
+      });
+      report.investigation.hypotheses += 1;
+    } catch (error) {
+      skip(id, `hypothesis: ${(error as Error).message}`);
+    }
+  }
+
+  const revisions = new Map<string, string>();
+  for (const item of readJsonLines(files.skillPatterns) as Array<Record<string, any>>) {
+    const id = String(item.revision_id ?? sourceId(item));
+    try {
+      const previous = item.previous_revision_id ? revisions.get(item.previous_revision_id) : null;
+      if (item.previous_revision_id && !previous) { skip(id, "skill pattern: its previous revision was not imported"); continue; }
+      const result = skills.recordPattern(op("pattern", id), {
+        patternId: item.pattern_id, previousRevisionId: previous ?? null, title: item.title, summary: item.summary,
+        evidenceRefs: item.evidence_refs ?? [], surface, imported: provenance(id),
+      });
+      revisions.set(id, (result.event as { revisionId: string }).revisionId);
+      report.investigation.patternRevisions += 1;
+    } catch (error) {
+      skip(id, `skill pattern: ${(error as Error).message}`);
+    }
+  }
+  for (const item of readJsonLines(files.skillVersions) as Array<Record<string, any>>) {
+    const id = `${item.skill_id}@${item.version_id}`;
+    try {
+      skills.proposeVersion(op("skill-version", id), {
+        skillId: item.skill_id, versionId: item.version_id, parentVersionId: item.parent_version_id ?? null, cluster: item.cluster,
+        content: item.content, unifiedDiff: item.unified_diff || null, motivatingRefs: item.motivating_refs ?? [],
+        targetSurfaces: item.target_surfaces ?? [], validationPlan: typeof item.validation_plan === "string" ? item.validation_plan : null,
+        surface, imported: provenance(id),
+      });
+      report.investigation.versions += 1;
+    } catch (error) {
+      skip(id, `skill version: ${(error as Error).message}`);
+    }
+  }
+  for (const item of readJsonLines(files.skillValidations) as Array<Record<string, any>>) {
+    const id = String(item.decision_id ?? sourceId(item));
+    try {
+      skills.recordValidation(op("skill-validation", id), {
+        skillId: item.skill_id, versionId: item.version_id, outcome: item.outcome as ValidationOutcome,
+        baselineScore: item.baseline_score ?? null, candidateScore: item.candidate_score ?? null,
+        evidenceRefs: item.evidence_refs ?? [], reason: item.reason, surface, imported: provenance(id),
+      });
+      report.investigation.validations += 1;
+    } catch (error) {
+      skip(id, `skill validation: ${(error as Error).message}`);
+    }
+  }
+  if (fs.existsSync(files.skillPointers)) {
+    const parsed = JSON.parse(fs.readFileSync(files.skillPointers, "utf8")) as { pointers?: Array<Record<string, any>> };
+    for (const pointer of parsed.pointers ?? []) {
+      report.investigation.skillsPendingReactivation.push({
+        skillId: String(pointer.skill_id), versionId: String(pointer.active_version_id), sourceDecisionId: pointer.decision_id ?? null,
       });
     }
   }

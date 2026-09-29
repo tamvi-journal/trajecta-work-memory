@@ -17,6 +17,7 @@ export interface HandoffInput {
   target: SurfaceKind;
   cue: string;
   maxBytes?: number;
+  claimEpoch?: number;
 }
 
 export class TrajectaRelay {
@@ -40,13 +41,14 @@ export class TrajectaRelay {
       openLoops: input.openLoops,
       nextAction: input.nextAction,
       targetSurface: input.target,
+      ...(input.claimEpoch !== undefined ? { claimEpoch: input.claimEpoch } : {}),
     });
     const packet = this.store.transfer(input.workId, input.cue, input.target, input.maxBytes);
     const receipt: TransportReceipt = { level: "packet-created", reference: packet.packetId };
     return { packet, receipt, work: captured.work };
   }
 
-  accept(packet: TransferPacket, operationId: string, instruction?: string) {
+  accept(packet: TransferPacket, operationId: string, instruction?: string, claimEpoch?: number) {
     if (packet.schema !== "trajecta.transfer/v1") throw new Error("Unsupported transfer packet schema");
     if (packet.intendedFor !== this.surface.kind) throw new Error("Transfer packet is intended for a different surface kind");
     const resumed = this.store.resume({
@@ -55,6 +57,7 @@ export class TrajectaRelay {
       expectedRevision: packet.resume.expectedRevision,
       surface: this.surface,
       instruction,
+      ...(claimEpoch !== undefined ? { claimEpoch } : {}),
     });
     const receipt: TransportReceipt = { level: "target-resumed", reference: resumed.delta.id };
     return { ...resumed, receipt };

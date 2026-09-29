@@ -17,10 +17,13 @@ import { DomainJournal } from "./journal.ts";
 import { assertSafe, UnsafeInput } from "./safety.ts";
 import { CHRONICLE_STAGES, LearningLayer, type ChronicleStage } from "./learning.ts";
 import { receiptResolver } from "./receipts.ts";
+import { CASE_STATUSES, CaseLayer, HYPOTHESIS_STATUSES, type CaseStatus, type HypothesisStatus } from "./cases.ts";
+import { SkillLayer, VALIDATION_OUTCOMES, type ValidationOutcome } from "./skills.ts";
+import { claimFence, ClaimLayer } from "./claims.ts";
 import type { DeltaKind, Surface, SurfaceKind } from "./types.ts";
 
 export const SERVER_NAME = "trajecta-work-memory";
-export const SERVER_VERSION = "0.4.0";
+export const SERVER_VERSION = "0.5.0";
 const CAPTURE_KINDS: DeltaKind[] = [
   "instruction", "decision", "progress", "blocker", "correction", "next_action",
   "branch_open", "branch_park", "synthesis", "outcome", "contract_anchor",
@@ -56,6 +59,10 @@ function tool(name: string, description: string, properties: Json = {}, required
   return { name, description, inputSchema: { type: "object", properties, required, additionalProperties: false }, annotations };
 }
 const opId = { type: "string", maxLength: 200, description: "Optional idempotency key such as operation:abc-123. Retrying with the same key and input returns the same result." };
+const claimEpoch = { type: "integer", minimum: 1, description: "Your claim epoch (from work_claim). Required only while the work has a live claim." };
+const caseIdS = { type: "string", pattern: "^case:[A-Za-z0-9][A-Za-z0-9._-]{0,150}$" };
+const hypothesisIdS = { type: "string", pattern: "^hypothesis:[A-Za-z0-9][A-Za-z0-9._-]{0,150}$" };
+const ident = { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$" };
 
 export const TOOLS = [
   tool("work_list", "List work items: id, topic, status, revision, next action, open loops."),
@@ -92,6 +99,7 @@ export const TOOLS = [
         required: ["label", "purpose", "cues", "return_point"],
         additionalProperties: false,
       },
+      claim_epoch: claimEpoch,
       operation_id: opId,
     }, ["work_id", "expected_revision", "kind", "summary"], W),
   tool("work_handoff", "Hand work to the other surface (cloud ⇄ local). Records the handoff and returns a bounded transfer packet.",
@@ -103,10 +111,11 @@ export const TOOLS = [
       provenance: strs,
       open_loops: strs,
       next_action: { type: ["string", "null"], maxLength: 1000 },
+      claim_epoch: claimEpoch,
       operation_id: opId,
     }, ["work_id", "expected_revision", "summary", "cue"], W),
   tool("work_resume", "Resume work on this surface at the expected revision.",
-    { work_id: str, expected_revision: rev, instruction: { type: "string", maxLength: 1000 }, operation_id: opId },
+    { work_id: str, expected_revision: rev, instruction: { type: "string", maxLength: 1000 }, claim_epoch: claimEpoch, operation_id: opId },
     ["work_id", "expected_revision"], W),
   tool("work_packet", "Render a bounded transfer packet for one work item without changing anything.",
     { work_id: str, cue: { type: "string", minLength: 1, maxLength: 500 }, target: { type: "string", enum: ["cloud", "local"] } },
@@ -160,7 +169,7 @@ export const TOOLS = [
   tool("work_close", "Close a work item as complete or abandoned. Needs a work-close receipt the owner issued with `trajecta approve-close` for this exact revision and request.",
     {
       work_id: str, expected_revision: rev, status: { type: "string", enum: ["complete", "abandoned"] },
-      summary: { type: "string", minLength: 1, maxLength: 1000 }, verification_ref: str, provenance: strs, operation_id: opId,
+      summary: { type: "string", minLength: 1, maxLength: 1000 }, verification_ref: str, provenance: strs, claim_epoch: claimEpoch, operation_id: opId,
     }, ["work_id", "expected_revision", "status", "summary", "verification_ref"], W),
   tool("work_context", "Bounded context for one work item (or the open work in one cluster). mode: normal | debug | audit.",
     {
@@ -169,6 +178,48 @@ export const TOOLS = [
       mode: { type: "string", enum: ["normal", "debug", "audit"] },
       budget_chars: { type: "integer", minimum: 800, maximum: 60000 },
     }, ["mode"]),
+  tool("work_claim", "Claim exclusive execution of a work item for this session (a lease, default 120 minutes). While the claim is live, other sessions cannot capture, resume or close the work, and you must pass claim_epoch. Claiming again renews your own claim. Handoff does not move a claim: release it, and the receiver claims.",
+    { work_id: str, lease_minutes: { type: "integer", minimum: 1, maximum: 720 }, operation_id: opId }, ["work_id"], W),
+  tool("work_release", "Release your claim on a work item (holder session and exact epoch must match).",
+    { work_id: str, claim_epoch: { type: "integer", minimum: 1 }, operation_id: opId }, ["work_id", "claim_epoch"], W),
+  tool("work_case_open", "Open a debug case over one or more work items.",
+    { case_id: caseIdS, title: { type: "string", minLength: 1, maxLength: 200 }, work_ids: { ...strs, minItems: 1 }, signatures: strs, evidence_refs: { ...strs, minItems: 1 }, operation_id: opId },
+    ["case_id", "title", "work_ids", "evidence_refs"], W),
+  tool("work_case_event", "Add or remove an incident in a case, or move its status (open → resolved | challenged | deprioritized …). resolved needs resolution_hypothesis_ids: supported hypotheses of this case, at least one attested here.",
+    {
+      case_id: caseIdS, event_type: { type: "string", enum: ["member_added", "member_removed", "status"] }, incident_id: str,
+      status: { type: "string", enum: [...CASE_STATUSES] }, resolution_hypothesis_ids: strs, evidence_refs: { ...strs, minItems: 1 }, operation_id: opId,
+    }, ["case_id", "event_type", "evidence_refs"], W),
+  tool("work_hypothesis", "Propose a hypothesis in a case, or record its verdict. supported/refuted need verification_ref (test:, commit:, tool:, artifact: or audit:) listed in supporting_refs / disconfirming_refs. A verdict is final; a new idea is a new hypothesis. Hypotheses never become policy.",
+    {
+      hypothesis_id: hypothesisIdS, case_id: caseIdS, status: { type: "string", enum: [...HYPOTHESIS_STATUSES] },
+      statement: { type: "string", minLength: 1, maxLength: 1000 }, signature: str, supporting_refs: strs, disconfirming_refs: strs,
+      discriminating_check: { type: "string", maxLength: 1000 }, verification_ref: str, operation_id: opId,
+    }, ["hypothesis_id", "case_id", "status", "statement"], W),
+  tool("work_case_get", "Read one case and its hypotheses. mode: normal | debug | audit.",
+    { case_id: caseIdS, mode: { type: "string", enum: ["normal", "debug", "audit"] } }, ["case_id"]),
+  tool("work_skill_pattern", "Record a revision of an observed skill pattern. previous_revision_id must be the latest revision (omit for the first).",
+    { pattern_id: ident, previous_revision_id: str, title: { type: "string", minLength: 1, maxLength: 200 }, summary: { type: "string", minLength: 1, maxLength: 2000 }, evidence_refs: { ...strs, minItems: 1 }, operation_id: opId },
+    ["pattern_id", "title", "summary", "evidence_refs"], W),
+  tool("work_skill_propose", "Propose an immutable skill version. A skill's first version has no parent; later versions name their parent. Proposing never activates.",
+    {
+      skill_id: ident, version_id: ident, parent_version_id: ident, cluster: { type: "string", pattern: CLUSTER_ID.source },
+      content: { type: "string", minLength: 1, maxLength: 50000 }, unified_diff: { type: "string", maxLength: 50000 }, motivating_refs: { ...strs, minItems: 1 },
+      target_surfaces: strs, validation_plan: { type: "string", maxLength: 4000 }, operation_id: opId,
+    }, ["skill_id", "version_id", "cluster", "content", "motivating_refs"], W),
+  tool("work_skill_validate", "Record a validation of a skill version. accepted needs candidate_score > baseline_score (0..1) and must come from a different session than the proposer.",
+    {
+      skill_id: ident, version_id: ident, outcome: { type: "string", enum: [...VALIDATION_OUTCOMES] },
+      baseline_score: { type: "number", minimum: 0, maximum: 1 }, candidate_score: { type: "number", minimum: 0, maximum: 1 },
+      evidence_refs: { ...strs, minItems: 1 }, reason: { type: "string", minLength: 1, maxLength: 1000 }, operation_id: opId,
+    }, ["skill_id", "version_id", "outcome", "evidence_refs", "reason"], W),
+  tool("work_skill_activate", "Make a validated version the active one. Needs a receipt the owner issued with `trajecta approve-skill` for this exact version, decision and current active version.",
+    { skill_id: ident, version_id: ident, decision_id: str, approval_ref: str, operation_id: opId }, ["skill_id", "version_id", "decision_id", "approval_ref"], W),
+  tool("work_skill_rollback", "Return a skill to a version that was active before. Needs a receipt the owner issued with `trajecta approve-rollback`.",
+    { skill_id: ident, to_version_id: ident, reason: { type: "string", minLength: 1, maxLength: 1000 }, evidence_refs: strs, approval_ref: str, operation_id: opId },
+    ["skill_id", "to_version_id", "reason", "approval_ref"], W),
+  tool("work_skill_get", "Read a skill's active content. mode audit adds versions, validations and pointer history.",
+    { skill_id: ident, mode: { type: "string", enum: ["normal", "audit"] } }, ["skill_id"]),
 ];
 
 function summarize(item: ReturnType<TrajectaStore["getWork"]>) {
@@ -193,13 +244,24 @@ export class WorkServer {
   private readonly clusters;
   private readonly capabilities;
   readonly learning: LearningLayer;
+  readonly cases: CaseLayer;
+  readonly skills: SkillLayer;
+  readonly claims: ClaimLayer;
   constructor(store: TrajectaStore, surface: Surface, options: { profile?: WorkProfile; resolveReceipt?: (reference: string) => unknown } = {}) {
     this.store = store;
     this.surface = surface;
     this.profile = options.profile ?? loadProfile(store.root);
     this.clusters = clusterJournal(store.root);
     this.capabilities = new DomainJournal(store.root, CAPABILITY_SNAPSHOTS);
-    this.learning = new LearningLayer(store, { resolveReceipt: options.resolveReceipt ?? receiptResolver(store.root), guards: this.profile.guards });
+    const resolveReceipt = options.resolveReceipt ?? receiptResolver(store.root);
+    this.learning = new LearningLayer(store, { resolveReceipt, guards: this.profile.guards });
+    this.cases = new CaseLayer(store);
+    this.skills = new SkillLayer(store.root, { resolveReceipt });
+    this.claims = new ClaimLayer(store);
+  }
+
+  private epoch(args: Json) {
+    return args.claim_epoch === undefined ? {} : { claimEpoch: Number(args.claim_epoch) };
   }
 
   private op(args: Json) {
@@ -268,7 +330,7 @@ export class WorkServer {
         const closed = s.close({
           operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision), surface: this.surface,
           status: args.status as "complete" | "abandoned", summary: String(args.summary), verificationRef: String(args.verification_ref),
-          provenance: (args.provenance as string[]) ?? [],
+          provenance: (args.provenance as string[]) ?? [], ...this.epoch(args),
         });
         return { work: summarize(closed.work), delta: { id: closed.delta.id, revision: closed.delta.revision } };
       }
@@ -278,7 +340,86 @@ export class WorkServer {
           cluster: typeof args.cluster === "string" ? args.cluster : undefined,
           mode: String(args.mode) as ContextMode,
           budgetChars: args.budget_chars === undefined ? undefined : Number(args.budget_chars),
-        }, this.learning);
+        }, this.learning, { cases: this.cases, skills: this.skills });
+      case "work_claim": {
+        if (!s.admits) throw new Error("This store does not enforce claims (no claim fence configured); a claim would not protect anything");
+        const result = this.claims.claim(this.op(args), { workId: String(args.work_id), surface: this.surface, leaseMinutes: args.lease_minutes as number | undefined });
+        const event = result.event;
+        return { work_id: event.workId, claim_id: event.claimId, claim_epoch: event.epoch, expires_at: event.expiresAt, renewed: event.type === "renewed", replayed: result.replayed };
+      }
+      case "work_release": {
+        const result = this.claims.release(this.op(args), { workId: String(args.work_id), surface: this.surface, claimEpoch: Number(args.claim_epoch) });
+        return { work_id: result.event.workId, released_epoch: result.event.epoch, replayed: result.replayed };
+      }
+      case "work_case_open": {
+        const result = this.cases.recordCaseEvent(this.op(args), {
+          caseId: String(args.case_id), eventType: "open", title: String(args.title), workIds: args.work_ids as string[],
+          signatures: args.signatures as string[] | undefined, evidenceRefs: args.evidence_refs as string[], surface: this.surface,
+        });
+        return { case_id: String(args.case_id), event_id: result.event.id, replayed: result.replayed };
+      }
+      case "work_case_event": {
+        const type = String(args.event_type);
+        if (!["member_added", "member_removed", "status"].includes(type)) throw new Error("event_type must be member_added, member_removed or status; use work_case_open to open");
+        const result = this.cases.recordCaseEvent(this.op(args), {
+          caseId: String(args.case_id), eventType: type as "member_added" | "member_removed" | "status",
+          incidentId: args.incident_id as string | undefined, status: args.status as CaseStatus | undefined,
+          resolutionHypothesisIds: args.resolution_hypothesis_ids as string[] | undefined, evidenceRefs: args.evidence_refs as string[], surface: this.surface,
+        });
+        return { case_id: String(args.case_id), event_id: result.event.id, replayed: result.replayed, case: this.cases.getCase(String(args.case_id)) };
+      }
+      case "work_hypothesis": {
+        const result = this.cases.recordHypothesis(this.op(args), {
+          hypothesisId: String(args.hypothesis_id), caseId: String(args.case_id), status: args.status as HypothesisStatus,
+          statement: String(args.statement), signature: args.signature as string | undefined,
+          supportingRefs: args.supporting_refs as string[] | undefined, disconfirmingRefs: args.disconfirming_refs as string[] | undefined,
+          discriminatingCheck: args.discriminating_check as string | undefined, verificationRef: args.verification_ref as string | undefined,
+          surface: this.surface,
+        });
+        return { hypothesis_id: String(args.hypothesis_id), status: args.status, event_id: result.event.id, replayed: result.replayed };
+      }
+      case "work_case_get":
+        return this.cases.getCase(String(args.case_id), (args.mode as "normal" | "debug" | "audit" | undefined) ?? "normal");
+      case "work_skill_pattern": {
+        const result = this.skills.recordPattern(this.op(args), {
+          patternId: String(args.pattern_id), previousRevisionId: (args.previous_revision_id as string | undefined) ?? null,
+          title: String(args.title), summary: String(args.summary), evidenceRefs: args.evidence_refs as string[], surface: this.surface,
+        });
+        return { pattern_id: String(args.pattern_id), revision_id: (result.event as { revisionId: string }).revisionId, replayed: result.replayed };
+      }
+      case "work_skill_propose": {
+        const result = this.skills.proposeVersion(this.op(args), {
+          skillId: String(args.skill_id), versionId: String(args.version_id), parentVersionId: (args.parent_version_id as string | undefined) ?? null,
+          cluster: String(args.cluster), content: String(args.content), unifiedDiff: args.unified_diff as string | undefined,
+          motivatingRefs: args.motivating_refs as string[], targetSurfaces: args.target_surfaces as string[] | undefined,
+          validationPlan: args.validation_plan as string | undefined, surface: this.surface,
+        });
+        return { skill_id: String(args.skill_id), version_id: String(args.version_id), content_digest: (result.event as { contentDigest: string }).contentDigest, active: false, replayed: result.replayed };
+      }
+      case "work_skill_validate": {
+        const result = this.skills.recordValidation(this.op(args), {
+          skillId: String(args.skill_id), versionId: String(args.version_id), outcome: args.outcome as ValidationOutcome,
+          baselineScore: args.baseline_score as number | undefined, candidateScore: args.candidate_score as number | undefined,
+          evidenceRefs: args.evidence_refs as string[], reason: String(args.reason), surface: this.surface,
+        });
+        const event = result.event as { decisionId: string; eligible: boolean };
+        return { decision_id: event.decisionId, eligible_for_activation: event.eligible, replayed: result.replayed };
+      }
+      case "work_skill_activate": {
+        const result = this.skills.activate(this.op(args), {
+          skillId: String(args.skill_id), versionId: String(args.version_id), decisionId: String(args.decision_id), approvalRef: String(args.approval_ref), surface: this.surface,
+        });
+        return { skill_id: String(args.skill_id), active_version_id: String(args.version_id), replayed: result.replayed };
+      }
+      case "work_skill_rollback": {
+        const result = this.skills.rollback(this.op(args), {
+          skillId: String(args.skill_id), toVersionId: String(args.to_version_id), reason: String(args.reason),
+          evidenceRefs: args.evidence_refs as string[] | undefined, approvalRef: String(args.approval_ref), surface: this.surface,
+        });
+        return { skill_id: String(args.skill_id), active_version_id: String(args.to_version_id), replayed: result.replayed };
+      }
+      case "work_skill_get":
+        return this.skills.getSkill(String(args.skill_id), (args.mode as "normal" | "audit" | undefined) ?? "normal");
       case "work_list":
         return { work: s.list().map(summarize) };
       case "work_route":
@@ -305,7 +446,7 @@ export class WorkServer {
           surface: this.surface, kind: args.kind as DeltaKind, summary: String(args.summary),
           provenance: (args.provenance as string[]) ?? [], openLoops: args.open_loops as string[] | undefined,
           nextAction: args.next_action as string | null | undefined,
-          branchId: args.branch_id as string | undefined, branch: branchInput(args.branch),
+          branchId: args.branch_id as string | undefined, branch: branchInput(args.branch), ...this.epoch(args),
         });
         return { work: summarize(captured.work), delta: { id: captured.delta.id, revision: captured.delta.revision } };
       }
@@ -318,13 +459,14 @@ export class WorkServer {
           provenance: (args.provenance as string[]) ?? [],
           openLoops: (args.open_loops as string[] | undefined) ?? current.openLoops,
           nextAction: args.next_action === undefined ? current.nextAction : (args.next_action as string | null),
+          ...this.epoch(args),
         });
         return { work: summarize(result.work), packet: result.packet, receipt: result.receipt };
       }
       case "work_resume": {
         const resumed = s.resume({
           operationId: this.op(args), workId: String(args.work_id), expectedRevision: Number(args.expected_revision),
-          surface: this.surface, instruction: typeof args.instruction === "string" ? args.instruction : undefined,
+          surface: this.surface, instruction: typeof args.instruction === "string" ? args.instruction : undefined, ...this.epoch(args),
         });
         return { work: summarize(resumed.work) };
       }
@@ -374,7 +516,8 @@ export async function runStdio(env: NodeJS.ProcessEnv = process.env) {
   const root = defaultRoot(env);
   const profile = loadProfile(root, env.TRAJECTA_PROFILE?.trim() || undefined);
   const resolveReceipt = receiptResolver(root);
-  const server = new WorkServer(new TrajectaStore(root, undefined, undefined, { resolveReceipt }), surfaceFrom(env), { profile, resolveReceipt });
+  const store = new TrajectaStore(root, undefined, undefined, { resolveReceipt, admit: claimFence(root) });
+  const server = new WorkServer(store, surfaceFrom(env), { profile, resolveReceipt });
   process.stdin.setEncoding("utf8");
   let buffer = "";
   for await (const chunk of process.stdin) {

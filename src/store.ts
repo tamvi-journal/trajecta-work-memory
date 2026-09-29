@@ -3,11 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { withRootWriteLock, type LockOptions } from "./lock.ts";
 import type {
+  AdmitContext,
   Branch,
   CloseWorkInput,
   CaptureDeltaInput,
   Delta,
   OpenWorkInput,
+  ResumeWorkInput,
   RouteMatch,
   Surface,
   TransferPacket,
@@ -358,12 +360,13 @@ export class TrajectaStore {
 
   private readonly lockOptions: LockOptions;
   private readonly resolveReceipt?: (reference: string) => unknown;
+  private readonly admit?: (context: AdmitContext) => void;
 
   constructor(
     root = path.resolve(".trajecta"),
     clock: () => Date = () => new Date(),
     fault?: (point: StoreFaultPoint) => void,
-    options: { lock?: LockOptions; resolveReceipt?: (reference: string) => unknown } = {},
+    options: { lock?: LockOptions; resolveReceipt?: (reference: string) => unknown; admit?: (context: AdmitContext) => void } = {},
   ) {
     this.root = root;
     this.stateFile = path.join(root, "state.json");
@@ -373,6 +376,21 @@ export class TrajectaStore {
     this.fault = fault;
     this.lockOptions = options.lock ?? {};
     this.resolveReceipt = options.resolveReceipt;
+    this.admit = options.admit;
+  }
+
+  /** True when this store runs an admission check (the claim fence) on work mutations. */
+  get admits() {
+    return Boolean(this.admit);
+  }
+
+  /**
+   * Admission check for a mutation of an existing work item. Called under
+   * the root lock after replay, recovery and re-reading state, before CAS.
+   * Must be a pure check (see docs/specs/2026-09-29-phase3-cases-skills-claims.md §C).
+   */
+  private admitted(workId: string, surface: Surface, kind: AdmitContext["kind"], claimEpoch: number | undefined) {
+    this.admit?.({ workId, surface: structuredClone(surface), kind, claimEpoch });
   }
 
   /** Run one mutation under the root write lock (see lock.ts). */
@@ -540,6 +558,7 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
+    this.admitted(current.id, input.surface, "capture", input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Terminal work cannot accept new deltas");
     if (input.kind === "contract_anchor" && !(input.provenance?.length)) throw new Error("Contract anchors require provenance");
@@ -600,11 +619,11 @@ export class TrajectaStore {
     return this.commit(beforeState, state, delta, input);
   }
 
-  resume(input: { operationId: string; workId: string; expectedRevision: number; surface: Surface; instruction?: string }) {
+  resume(input: ResumeWorkInput) {
     return this.locked(() => this.resumeLocked(input));
   }
 
-  private resumeLocked(input: { operationId: string; workId: string; expectedRevision: number; surface: Surface; instruction?: string }) {
+  private resumeLocked(input: ResumeWorkInput) {
     const replay = this.replay(input.operationId, input);
     if (replay) return replay;
     this.recoverPending();
@@ -614,6 +633,7 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
+    this.admitted(current.id, input.surface, "resume", input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Terminal work cannot be resumed");
     const now = this.clock().toISOString();
@@ -654,7 +674,17 @@ export class TrajectaStore {
   close(input: CloseWorkInput) {
     // Stage 1 (locked): an already-committed close replays without touching
     // the verifier.
-    const done = this.locked(() => this.replay(input.operationId, input));
+    const done = this.locked(() => {
+      const replayed = this.replay(input.operationId, input);
+      if (replayed) return replayed;
+      // Preflight the claim fence so a refused caller never reaches the
+      // verifier. Stage 3 checks it again: the claim can change meanwhile.
+      if (this.admit) {
+        this.recoverPending();
+        if (this.readState().work.some((item) => item.id === input.workId)) this.admitted(input.workId, input.surface, "close", input.claimEpoch);
+      }
+      return null;
+    });
     if (done) return done;
     // A malformed new request must never reach the verifier, which may do
     // I/O or write to Trajecta.
@@ -680,6 +710,7 @@ export class TrajectaStore {
     const index = state.work.findIndex((item) => item.id === input.workId);
     if (index < 0) throw new Error("Work item not found");
     const current = state.work[index];
+    this.admitted(current.id, input.surface, "close", input.claimEpoch);
     if (current.revision !== input.expectedRevision) throw new RevisionConflict(current);
     if (["complete", "abandoned"].includes(current.status)) throw new Error("Work is already closed");
     if (input.status === "complete" && current.openLoops.length) {

@@ -89,6 +89,25 @@ export interface CaptureDeltaInput {
   openLoops?: string[];
   nextAction?: string | null;
   targetSurface?: SurfaceKind;
+  /** Current claim epoch; required only while a live claim exists (claim fence). */
+  claimEpoch?: number;
+}
+
+export interface ResumeWorkInput {
+  operationId: string;
+  workId: string;
+  expectedRevision: number;
+  surface: Surface;
+  instruction?: string;
+  claimEpoch?: number;
+}
+
+/** What the store's admission check (the claim fence) sees. */
+export interface AdmitContext {
+  workId: string;
+  surface: Surface;
+  kind: "capture" | "resume" | "close";
+  claimEpoch?: number;
 }
 
 export interface TransferPacket {
@@ -166,4 +185,5 @@ export interface CloseWorkInput {
   summary: string;
   verificationRef: string;
   provenance: string[];
+  claimEpoch?: number;
 }

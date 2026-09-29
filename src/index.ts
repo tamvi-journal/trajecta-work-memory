@@ -11,5 +11,11 @@ export { attemptVerifiedResume, inspectVerifiedResume } from "./adapters/proof/a
 export { renderResumeReceipt } from "./adapters/proof/receipt-renderer.ts";
 export { LearningLayer, GUARDS, GUARD_IDS, CHRONICLE_STAGES } from "./learning.ts";
 export type { CheckActionInput, GuardId, Incident, Invariant, Milestone, Friction, Tier } from "./learning.ts";
-export { ApprovalRejected, assertOwnerApproval, invariantDigest, issueReceipt, newReceiptId, receiptJournal, receiptResolver } from "./receipts.ts";
-export type { OwnerApprovalReceipt, Receipt } from "./receipts.ts";
+export { ApprovalRejected, assertOwnerApproval, assertSkillActivation, assertSkillRollback, invariantDigest, issueReceipt, newReceiptId, reasonDigest, receiptJournal, receiptResolver, SkillApprovalRejected } from "./receipts.ts";
+export type { OwnerApprovalReceipt, Receipt, SkillActivationReceipt, SkillRollbackReceipt } from "./receipts.ts";
+export { CaseLayer, CASE_STATUSES, HYPOTHESIS_STATUSES, VERIFICATION_REF } from "./cases.ts";
+export type { CaseRecord, CaseStatus, HypothesisRecord, HypothesisStatus } from "./cases.ts";
+export { SkillLayer, VALIDATION_OUTCOMES } from "./skills.ts";
+export type { SkillRecord, ValidationOutcome, ValidationRecord, VersionRecord } from "./skills.ts";
+export { ClaimConflict, claimFence, ClaimLayer } from "./claims.ts";
+export type { LiveClaim } from "./claims.ts";

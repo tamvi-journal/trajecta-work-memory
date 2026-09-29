@@ -1,0 +1,1 @@
+{"decision_id": "skill-decision:d1", "skill_id": "skill:observable-browser", "version_id": "skill-version:v1", "outcome": "accepted", "baseline_score": 0.4, "candidate_score": 0.8, "evidence_refs": ["test:browser-replay"], "reason": "Fewer headless fallbacks", "validator": "lam", "recorded_at": "2026-09-22T14:00:00.000Z"}
