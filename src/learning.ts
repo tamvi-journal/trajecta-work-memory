@@ -123,6 +123,8 @@ export interface Friction extends JournalEvent {
   groupKey: string;
   occurrence: number;
   tier: Tier;
+  /** Where the record came from (e.g. `source:awm:<id>` on import). Never counted. */
+  provenance?: string[];
 }
 
 export const FRICTION: DomainSpec<{ groups: Record<string, number> }, Friction> = {
@@ -316,7 +318,8 @@ export class LearningLayer {
     });
   }
 
-  recordFriction(operationId: string, input: { workId?: string | null; cluster: string; component: string; kind: string; summary: string; surface: Surface }) {
+  recordFriction(operationId: string, input: { workId?: string | null; cluster: string; component: string; kind: string; summary: string; provenance?: string[]; surface: Surface }) {
+    const provenance = refs(input.provenance, "provenance");
     const body = {
       workId: this.workOrNull(input.workId),
       cluster: cluster(input.cluster),
@@ -324,6 +327,8 @@ export class LearningLayer {
       kind: slug(input.kind, "kind"),
       summary: text(input.summary, "summary", 1_000),
       surface: input.surface,
+      // Only present when given, so friction recorded before this field existed replays unchanged.
+      ...(provenance.length ? { provenance } : {}),
     };
     return this.friction.append(operationId, body, (index) => {
       const key = groupKey(body.cluster, body.component, body.kind);

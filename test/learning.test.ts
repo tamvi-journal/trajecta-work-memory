@@ -158,6 +158,10 @@ test("friction climbs by occurrence", () => {
   const { learning } = setup();
   const record = (n: number) => learning.recordFriction(`operation:f${n}`, { cluster: "browser", component: "bridge", kind: "timeout", summary: "slow", surface: local }).event.tier;
   assert.deepEqual([record(1), record(2), record(3)], ["raw", "repeated", "learning_candidate"]);
+  assert.equal(learning.friction.events()[0].provenance, undefined, "no provenance field unless given");
+  const sourced = learning.recordFriction("operation:f4", { cluster: "browser", component: "bridge", kind: "timeout", summary: "slow", provenance: ["tool:bridge-log"], surface: local });
+  assert.deepEqual(sourced.event.provenance, ["tool:bridge-log"]);
+  assert.equal(sourced.event.occurrence, 4, "provenance never changes the count");
 });
 
 test("owner CLI issues receipts; agents close work and promote incidents over MCP with them", () => {
@@ -205,6 +209,7 @@ test("import brings incidents, friction and chronicle; source invariants wait fo
   const report = importLifecycle(store, SOURCE, "awm");
   assert.equal(report.learning.incidents, 3);
   assert.equal(report.learning.friction, 1);
+  assert.deepEqual(new LearningLayer(store).friction.events()[0].provenance, ["source:awm:friction:f1"], "imported friction keeps its source id");
   assert.equal(report.learning.milestones, 1, "chronicle of the archived task is skipped");
   assert.ok(report.skipped.some((item) => item.eventId === "incident:bad"));
   assert.ok(report.skipped.some((item) => item.eventId === "chronicle:m2"));
@@ -218,6 +223,23 @@ test("import brings incidents, friction and chronicle; source invariants wait fo
   const again = importLifecycle(store, SOURCE, "awm");
   assert.equal(again.learning.incidents, 3);
   assert.equal(learning.incidents.events().length, 3, "re-import adds nothing");
+});
+
+test("re-import over a store imported before friction kept provenance replays, not skips", () => {
+  const fresh = new TrajectaStore(tmp());
+  importLifecycle(fresh, SOURCE, "awm");
+  const recorded = new LearningLayer(fresh).friction.events()[0];
+  const ledger = fs.readFileSync(path.join(fresh.root, "domain-operations.jsonl"), "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const operationId = ledger.find((record) => record.domain === "friction").operationId;
+  // What the previous release wrote: same operation, no provenance.
+  const legacy = new TrajectaStore(tmp());
+  new LearningLayer(legacy).recordFriction(operationId, { cluster: recorded.cluster, component: recorded.component, kind: recorded.kind, summary: recorded.summary, surface: recorded.surface });
+  const report = importLifecycle(legacy, SOURCE, "awm");
+  assert.equal(report.learning.friction, 1);
+  assert.deepEqual(report.learning.frictionWithoutProvenance, ["friction:f1"]);
+  assert.ok(!report.skipped.some((item) => item.eventId === "friction:f1"), "not reported as skipped");
+  assert.equal(new LearningLayer(legacy).friction.events().length, 1, "no duplicate friction");
+  assert.deepEqual(importLifecycle(fresh, SOURCE, "awm").learning.frictionWithoutProvenance, [], "a store imported with provenance replays cleanly");
 });
 
 test("import keeps identical evidence identical, so repeats never climb the tier", () => {

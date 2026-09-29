@@ -140,7 +140,7 @@ export const TOOLS = [
       operation_id: opId,
     }, ["cluster", "kind", "summary", "violated_invariant", "evidence_refs", "correction", "prevention_rule"], W),
   tool("work_record_friction", "Record friction: a tool or system was hard to use (not an agent mistake).",
-    { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, component: { type: "string", maxLength: 64 }, kind: { type: "string", maxLength: 64 }, summary: { type: "string", minLength: 1, maxLength: 1000 }, operation_id: opId },
+    { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, component: { type: "string", maxLength: 64 }, kind: { type: "string", maxLength: 64 }, summary: { type: "string", minLength: 1, maxLength: 1000 }, provenance: strs, operation_id: opId },
     ["cluster", "component", "kind", "summary"], W),
   tool("work_record_milestone", "Add one chronicle milestone to a work item (goal, decision, rail, action, outcome, blocker, correction, next_action). Never a transcript.",
     { work_id: str, cluster: { type: "string", pattern: CLUSTER_ID.source }, stage: { type: "string", enum: [...CHRONICLE_STAGES] }, summary: { type: "string", minLength: 1, maxLength: 1000 }, provenance: strs, operation_id: opId },
@@ -242,7 +242,8 @@ export class WorkServer {
       }
       case "work_record_friction": {
         const result = this.learning.recordFriction(this.op(args), {
-          workId: args.work_id as string | undefined, cluster: String(args.cluster), component: String(args.component), kind: String(args.kind), summary: String(args.summary), surface: this.surface,
+          workId: args.work_id as string | undefined, cluster: String(args.cluster), component: String(args.component), kind: String(args.kind), summary: String(args.summary),
+          provenance: args.provenance as string[] | undefined, surface: this.surface,
         });
         return { friction_id: result.event.id, tier: result.event.tier, occurrence: result.event.occurrence, replayed: result.replayed };
       }

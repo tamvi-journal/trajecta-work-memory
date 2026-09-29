@@ -15,7 +15,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { canonicalStoreDigest, type TrajectaStore } from "./store.ts";
+import { canonicalStoreDigest, OperationConflict, type TrajectaStore } from "./store.ts";
 import { clusterJournal, parseLegacyCueRegistry, type CueRegistry } from "./clusters.ts";
 import { DomainJournal, type DomainSpec, type JournalEvent } from "./journal.ts";
 import { CHRONICLE_STAGES, LearningLayer, type ChronicleStage } from "./learning.ts";
@@ -139,6 +139,8 @@ export interface ImportReport {
   learning: {
     incidents: number;
     friction: number;
+    /** Source ids already imported before friction kept provenance (left as recorded). */
+    frictionWithoutProvenance: string[];
     milestones: number;
     /** Source invariants are never activated on import; the owner re-approves them. */
     invariantsPendingReapproval: Array<{ sourceId: string; cluster: string; rule: string; sourceIncidentId: string | null; importedIncidentId: string | null }>;
@@ -169,7 +171,7 @@ export function importLifecycle(store: TrajectaStore, sourceRoot: string, source
   const clusters = clusterJournal(store.root);
   const report: ImportReport = {
     schema: "trajecta.import-report/v1", source, sourceRoot: path.resolve(sourceRoot), sourceDigest, tasks: [], skipped: [], registry,
-    learning: { incidents: 0, friction: 0, milestones: 0, invariantsPendingReapproval: [] },
+    learning: { incidents: 0, friction: 0, frictionWithoutProvenance: [], milestones: 0, invariantsPendingReapproval: [] },
   };
   const op = (kind: string, id: string) => `operation:import-${source}-${kind}-${short(id)}`;
 
@@ -349,10 +351,17 @@ function importLearning(
   }
   for (const item of readJsonLines(files.friction) as Array<Record<string, any>>) {
     try {
-      learning.recordFriction(op("friction", String(item.id)), {
-        workId: item.task_id ? workFor.get(item.task_id) ?? null : null,
-        cluster: item.cluster, component: item.component, kind: item.kind, summary: item.summary, surface,
-      });
+      const operationId = op("friction", String(item.id));
+      const body = { workId: item.task_id ? workFor.get(item.task_id) ?? null : null, cluster: item.cluster, component: item.component, kind: item.kind, summary: item.summary, surface };
+      try {
+        learning.recordFriction(operationId, { ...body, provenance: [`source:${source}:${item.id}`] });
+      } catch (error) {
+        if (!(error instanceof OperationConflict)) throw error;
+        // Imported by a release that did not keep friction provenance: replay
+        // that exact record (append-only, so it stays without provenance) and say so.
+        learning.recordFriction(operationId, body);
+        report.learning.frictionWithoutProvenance.push(String(item.id));
+      }
       report.learning.friction += 1;
     } catch (error) {
       skip(item.id, `friction: ${(error as Error).message}`);

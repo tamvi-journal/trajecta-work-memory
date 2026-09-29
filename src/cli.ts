@@ -59,10 +59,11 @@ Commands:
 Owner approvals (run these yourself; agents cannot issue receipts over MCP):
   approve-promotion <incident-id> [--expires-hours N] [--provenance a:b,c:d]
       Approve turning a learning_candidate incident into an accepted rule.
-  approve-close <work-id> <complete|abandoned> --summary "..." [--provenance a:b,c:d]
-      [--evidence-class test|review|owner-ack] [--authority owner] [--expires-hours N]
+  approve-close <work-id> complete  --summary "..." --provenance a:b,c:d  [options]
+  approve-close <work-id> abandoned --summary "..." [--provenance a:b,c:d] [options]
+      options: [--evidence-class test|review|owner-ack] [--authority owner] [--expires-hours N]
       Approve closing a work item at its current revision with exactly this
-      summary and provenance.
+      summary and provenance. A complete close needs --provenance and no open loops.
 `;
 
 try {
@@ -106,7 +107,7 @@ try {
   } else if (command === "approve-close") {
     const [workId, status] = args;
     if (!workId || (status !== "complete" && status !== "abandoned") || !named.summary) {
-      throw new Error("Usage: trajecta approve-close <work-id> <complete|abandoned> --summary \"...\" [--provenance a:b,c:d]");
+      throw new Error("Usage: trajecta approve-close <work-id> <complete|abandoned> --summary \"...\" --provenance a:b,c:d   (provenance optional only for abandoned)");
     }
     const work = store.getWork(workId);
     const provenance = list(named.provenance);
