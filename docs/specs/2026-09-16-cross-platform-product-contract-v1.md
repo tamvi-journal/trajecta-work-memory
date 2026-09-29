@@ -265,6 +265,10 @@ A stale client MUST be rejected with enough information to reconcile. It MUST NO
 
 Until `trajectad` exists, and underneath it afterwards, the core serialises every store and domain-journal mutation on a root with one cross-process lock (`<root>/.trajecta-write-lock/`, atomic `mkdir`, owner nonce/pid/hostname). CAS is checked after the lock is held, so two writers at the same revision produce one success and one `RevisionConflict`, never a lost write. An ownerless lock is `LockInDoubt` and is never removed automatically; a stale lock is recovered only on the same host with a dead owner pid. See `docs/specs/2026-09-28-core-root-lock-and-close.md`.
 
+### Work claims: the lease in core (2026-09-29)
+
+The lease above is implemented as a **work claim** (`claims` domain journal): holder = surface kind + name + session, epoch, `expiresAt`. Claiming or renewing never changes the work revision. The store's admission hook (`admit`) checks the claim under the root lock after replay, recovery and re-read, before CAS, for capture/resume/close (not open). While a claim is live, only its holder with the exact epoch may mutate; the epoch never resets. Claims are explicit in this phase; moving a claim inside handoff/resume needs a composite crash-safe transaction and is deferred. A claim is granted only after pending store operations are settled. **Deployment invariant:** the claim guarantee holds only when every writer on the root runs a fenced store (the MCP server does); a raw or custom `TrajectaStore` without the admit hook does not obey claims and MUST NOT share a root with claim users. See `docs/specs/2026-09-29-phase3-cases-skills-claims.md`.
+
 ---
 
 ## 7. Durable storage contract

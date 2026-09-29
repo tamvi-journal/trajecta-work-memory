@@ -5,7 +5,8 @@ import { importLifecycle } from "./import-lifecycle.ts";
 import { defaultRoot } from "./mcp.ts";
 import { INCIDENTS } from "./learning.ts";
 import { DomainJournal } from "./journal.ts";
-import { invariantDigest, issueReceipt, newReceiptId, receiptJournal, type OwnerApprovalReceipt } from "./receipts.ts";
+import { invariantDigest, issueReceipt, newReceiptId, receiptJournal, type OwnerApprovalReceipt, type SkillActivationReceipt, type SkillRollbackReceipt } from "./receipts.ts";
+import { SkillLayer } from "./skills.ts";
 import { own } from "./clusters.ts";
 import type { WorkCloseReceipt } from "./types.ts";
 
@@ -64,6 +65,12 @@ Owner approvals (run these yourself; agents cannot issue receipts over MCP):
       options: [--evidence-class test|review|owner-ack] [--authority owner] [--expires-hours N]
       Approve closing a work item at its current revision with exactly this
       summary and provenance. A complete close needs --provenance and no open loops.
+  approve-skill <skill-id> <version-id> <decision-id> [--expires-hours N] [--provenance a:b,c:d]
+      Approve making a validated skill version active. The decision must be an
+      accepted, independent validation of that version, and the version must be
+      a direct child of the currently active one.
+  approve-rollback <skill-id> <to-version-id> --reason "..." [--expires-hours N] [--provenance a:b,c:d]
+      Approve returning a skill to a version that was active before.
 `;
 
 try {
@@ -140,6 +147,30 @@ try {
       verification_ref: receipt.id, work_id: workId, expected_revision: work.revision, status, summary: named.summary.trim(), provenance,
       next: "The agent must call work_close with exactly this revision, status, summary and provenance.",
     });
+  } else if (command === "approve-skill") {
+    const [skillId, versionId, decisionId] = args;
+    if (!skillId || !versionId || !decisionId) throw new Error("Usage: trajecta approve-skill <skill-id> <version-id> <decision-id>");
+    const skills = new SkillLayer(root);
+    const terms = skills.activationTerms(skills.journal.read(), skillId, versionId, decisionId);
+    const now = new Date();
+    const receipt: SkillActivationReceipt = {
+      schema: "trajecta.owner-approval-receipt/v1", id: newReceiptId(), purpose: "skill_activation", ...terms,
+      authority: "owner", outcome: "approved", provenance: list(named.provenance), issuedAt: now.toISOString(), ...expiry(named, now),
+    };
+    issueReceipt(root, receipt);
+    print({ approval_ref: receipt.id, ...terms, next: "Give approval_ref to the agent for work_skill_activate with this skill, version and decision." });
+  } else if (command === "approve-rollback") {
+    const [skillId, toVersionId] = args;
+    if (!skillId || !toVersionId || !named.reason) throw new Error("Usage: trajecta approve-rollback <skill-id> <to-version-id> --reason \"...\"");
+    const skills = new SkillLayer(root);
+    const terms = skills.rollbackTerms(skills.journal.read(), skillId, toVersionId, named.reason);
+    const now = new Date();
+    const receipt: SkillRollbackReceipt = {
+      schema: "trajecta.owner-approval-receipt/v1", id: newReceiptId(), purpose: "skill_rollback", ...terms,
+      authority: "owner", outcome: "approved", provenance: list(named.provenance), issuedAt: now.toISOString(), ...expiry(named, now),
+    };
+    issueReceipt(root, receipt);
+    print({ approval_ref: receipt.id, skill_id: skillId, from_version_id: terms.fromVersionId, to_version_id: toVersionId, expected_pointer_epoch: terms.expectedPointerEpoch, reason: named.reason.trim(), next: "Give approval_ref to the agent for work_skill_rollback with exactly this reason." });
   } else {
     process.stdout.write(HELP);
   }

@@ -31,7 +31,44 @@ export interface OwnerApprovalReceipt {
   expiresAt?: string;
 }
 
-export type Receipt = WorkCloseReceipt | OwnerApprovalReceipt;
+/** Owner approval to make one validated skill version the active one. */
+export interface SkillActivationReceipt {
+  schema: "trajecta.owner-approval-receipt/v1";
+  id: string;
+  purpose: "skill_activation";
+  skillId: string;
+  versionId: string;
+  /** The active version this one replaces (its parent); null for a skill's first activation. */
+  expectedParentVersionId: string | null;
+  /** The skill's pointer epoch when the owner approved; any pointer move invalidates the receipt. */
+  expectedPointerEpoch: number;
+  decisionId: string;
+  contentDigest: string;
+  authority: "owner";
+  outcome: "approved";
+  provenance: string[];
+  issuedAt: string;
+  expiresAt?: string;
+}
+
+/** Owner approval to move a skill's active pointer back to a version that was active before. */
+export interface SkillRollbackReceipt {
+  schema: "trajecta.owner-approval-receipt/v1";
+  id: string;
+  purpose: "skill_rollback";
+  skillId: string;
+  fromVersionId: string;
+  toVersionId: string;
+  expectedPointerEpoch: number;
+  reasonDigest: string;
+  authority: "owner";
+  outcome: "approved";
+  provenance: string[];
+  issuedAt: string;
+  expiresAt?: string;
+}
+
+export type Receipt = WorkCloseReceipt | OwnerApprovalReceipt | SkillActivationReceipt | SkillRollbackReceipt;
 
 export interface ReceiptIssued extends JournalEvent {
   type: "issued";
@@ -48,7 +85,7 @@ function isReceipt(value: unknown): value is Receipt {
   const receipt = value as Partial<Receipt> | null;
   if (!receipt || typeof receipt.id !== "string" || !RECEIPT_ID.test(receipt.id) || typeof receipt.issuedAt !== "string") return false;
   if (receipt.schema === "trajecta.work-close-receipt/v1") return receipt.purpose === "work_close";
-  if (receipt.schema === "trajecta.owner-approval-receipt/v1") return receipt.purpose === "incident_promotion";
+  if (receipt.schema === "trajecta.owner-approval-receipt/v1") return ["incident_promotion", "skill_activation", "skill_rollback"].includes(receipt.purpose as string);
   return false;
 }
 
@@ -125,4 +162,52 @@ export function assertOwnerApproval(value: unknown, expected: { reference: strin
   const issued = Date.parse(String(receipt.issuedAt));
   if (!Number.isFinite(issued) || issued > now.getTime()) throw new ApprovalRejected("receipt issue time is invalid or in the future");
   if (receipt.expiresAt !== undefined && !(Date.parse(receipt.expiresAt) > now.getTime())) throw new ApprovalRejected("receipt has expired");
+}
+
+export class SkillApprovalRejected extends Error {
+  constructor(reason: string) {
+    super(`Skill approval rejected: ${reason}`);
+    this.name = "SkillApprovalRejected";
+  }
+}
+
+/** Digest a rollback receipt carries for its reason. */
+export function reasonDigest(reason: string) {
+  return canonicalStoreDigest({ reason: reason.trim() });
+}
+
+function assertOwnerCommon(receipt: Record<string, unknown>, reference: string, now: Date, reject: (reason: string) => Error) {
+  if (receipt.schema !== "trajecta.owner-approval-receipt/v1") throw reject("unsupported schema");
+  if (receipt.id !== reference) throw reject("receipt id does not match the reference");
+  if (receipt.authority !== "owner") throw reject("only the owner can approve this");
+  if (receipt.outcome !== "approved") throw reject("receipt is not an approval");
+  const issued = Date.parse(String(receipt.issuedAt));
+  if (!Number.isFinite(issued) || issued > now.getTime()) throw reject("receipt issue time is invalid or in the future");
+  if (receipt.expiresAt !== undefined && !(Date.parse(String(receipt.expiresAt)) > now.getTime())) throw reject("receipt has expired");
+}
+
+export function assertSkillActivation(value: unknown, expected: { reference: string; skillId: string; versionId: string; expectedParentVersionId: string | null; expectedPointerEpoch: number; decisionId: string; contentDigest: string }, now: Date) {
+  const receipt = value as Record<string, unknown> | null | undefined;
+  const reject = (reason: string) => new SkillApprovalRejected(reason);
+  if (!receipt) throw reject("no receipt found for this reference");
+  if (receipt.purpose !== "skill_activation") throw reject(`purpose ${String(receipt.purpose)} cannot activate a skill`);
+  assertOwnerCommon(receipt, expected.reference, now, reject);
+  if (receipt.skillId !== expected.skillId || receipt.versionId !== expected.versionId) throw reject("receipt is for a different skill version");
+  if (receipt.expectedParentVersionId !== expected.expectedParentVersionId) throw reject("receipt expects a different active version");
+  if (receipt.expectedPointerEpoch !== expected.expectedPointerEpoch) throw reject(`receipt was issued at pointer epoch ${String(receipt.expectedPointerEpoch)}; the pointer is now at epoch ${expected.expectedPointerEpoch}`);
+  if (receipt.decisionId !== expected.decisionId) throw reject("receipt names a different validation");
+  if (receipt.contentDigest !== expected.contentDigest) throw reject("receipt approves different content");
+}
+
+export function assertSkillRollback(value: unknown, expected: { reference: string; skillId: string; fromVersionId: string; toVersionId: string; expectedPointerEpoch: number; reasonDigest: string }, now: Date) {
+  const receipt = value as Record<string, unknown> | null | undefined;
+  const reject = (reason: string) => new SkillApprovalRejected(reason);
+  if (!receipt) throw reject("no receipt found for this reference");
+  if (receipt.purpose !== "skill_rollback") throw reject(`purpose ${String(receipt.purpose)} cannot roll a skill back`);
+  assertOwnerCommon(receipt, expected.reference, now, reject);
+  if (receipt.skillId !== expected.skillId || receipt.fromVersionId !== expected.fromVersionId || receipt.toVersionId !== expected.toVersionId) {
+    throw reject("receipt is for a different rollback");
+  }
+  if (receipt.expectedPointerEpoch !== expected.expectedPointerEpoch) throw reject(`receipt was issued at pointer epoch ${String(receipt.expectedPointerEpoch)}; the pointer is now at epoch ${expected.expectedPointerEpoch}`);
+  if (receipt.reasonDigest !== expected.reasonDigest) throw reject("receipt approves a different reason");
 }
