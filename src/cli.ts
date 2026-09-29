@@ -170,7 +170,7 @@ try {
       authority: "owner", outcome: "approved", provenance: list(named.provenance), issuedAt: now.toISOString(), ...expiry(named, now),
     };
     issueReceipt(root, receipt);
-    print({ approval_ref: receipt.id, skill_id: skillId, from_version_id: terms.fromVersionId, to_version_id: toVersionId, reason: named.reason.trim(), next: "Give approval_ref to the agent for work_skill_rollback with exactly this reason." });
+    print({ approval_ref: receipt.id, skill_id: skillId, from_version_id: terms.fromVersionId, to_version_id: toVersionId, expected_pointer_epoch: terms.expectedPointerEpoch, reason: named.reason.trim(), next: "Give approval_ref to the agent for work_skill_rollback with exactly this reason." });
   } else {
     process.stdout.write(HELP);
   }

@@ -122,7 +122,9 @@ export class ClaimLayer {
     return withRootWriteLock(this.store.root, () => {
       const replayed = this.journal.replayHeld(operationId, request);
       if (replayed) return { ...replayed, replayed: true };
-      const work = this.store.getWork(input.workId);
+      // Settle any reserved store operation first (e.g. a close that crashed
+      // after its reservation), so a claim is only granted on settled state.
+      const work = this.store.getWorkSettledHeld(input.workId);
       if (["complete", "abandoned"].includes(work.status)) throw new Error("Closed work cannot be claimed");
       return { ...this.journal.appendHeld(operationId, request, (index) => {
         const now = this.clock();

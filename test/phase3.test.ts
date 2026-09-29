@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { TrajectaStore } from "../src/store.ts";
+import { closeIntentDigest, TrajectaStore, type StoreFaultPoint } from "../src/store.ts";
+import type { WorkCloseReceipt } from "../src/types.ts";
 import { ClaimConflict, claimFence, ClaimLayer } from "../src/claims.ts";
 import { CaseLayer } from "../src/cases.ts";
 import { SkillLayer } from "../src/skills.ts";
@@ -327,4 +328,72 @@ test("learning layer still reads incidents for case membership", () => {
   assert.throws(() => cases.recordCaseEvent("operation:m2", { caseId: "case:bridge-drop", eventType: "member_added", incidentId: incident.id, evidenceRefs: ["checkpoint:z"], surface: local }), /already in this case/);
   cases.recordCaseEvent("operation:m3", { caseId: "case:bridge-drop", eventType: "member_removed", incidentId: incident.id, evidenceRefs: ["checkpoint:z"], surface: local });
   assert.deepEqual(cases.getCase("case:bridge-drop").incident_ids, []);
+});
+
+// --- review fixes (Lam on #9) ---------------------------------------------------------
+
+function crashingStore(root: string, at: StoreFaultPoint, resolveReceipt?: (ref: string) => unknown) {
+  let armed = false;
+  const store = new TrajectaStore(root, undefined, (point) => { if (armed && point === at) throw new Error(`crash at ${point}`); }, { admit: claimFence(root), resolveReceipt });
+  return { store, arm: () => { armed = true; } };
+}
+
+for (const at of ["after-reserve", "after-delta"] as const) {
+  test(`a claim is granted only on settled state: a close that crashed ${at} is recovered and the claim refused`, () => {
+    const root = tmp();
+    const resolveReceipt = receiptResolver(root);
+    const { store, arm } = crashingStore(root, at, resolveReceipt);
+    const work = store.open({ operationId: "operation:open", topic: "Crash", goal: "Close then crash", surface: cloud }).work;
+    const receipt: WorkCloseReceipt = {
+      schema: "trajecta.work-close-receipt/v1", id: newReceiptId(), purpose: "work_close", workId: work.id, expectedRevision: 1, status: "abandoned",
+      intentDigest: closeIntentDigest({ workId: work.id, expectedRevision: 1, status: "abandoned", summary: "stop", provenance: [] }),
+      authority: "owner", evidenceClass: "", outcome: "approved", issuedAt: new Date(Date.now() - 1_000).toISOString(),
+    } as WorkCloseReceipt;
+    issueReceipt(root, receipt);
+    arm();
+    assert.throws(() => store.close({ operationId: "operation:close", workId: work.id, expectedRevision: 1, surface: cloud, status: "abandoned", summary: "stop", verificationRef: receipt.id, provenance: [] }), /crash at/);
+    const other = new TrajectaStore(root, undefined, undefined, { admit: claimFence(root) });
+    const claims = new ClaimLayer(other);
+    assert.throws(() => claims.claim("operation:claim-b", { workId: work.id, surface: local }), /Closed work cannot be claimed/);
+    assert.equal(claims.current(work.id), null, "no live claim is left behind");
+    assert.equal(other.getWork(work.id).status, "abandoned", "the pending close was settled first");
+  });
+}
+
+test("a pending capture is settled before a claim is granted", () => {
+  const root = tmp();
+  const { store, arm } = crashingStore(root, "after-delta");
+  const work = store.open({ operationId: "operation:open", topic: "Crash", goal: "Capture then crash", surface: cloud }).work;
+  arm();
+  assert.throws(() => store.capture({ operationId: "operation:cap", workId: work.id, expectedRevision: 1, surface: cloud, kind: "progress", summary: "half written" }), /crash at/);
+  const other = new TrajectaStore(root, undefined, undefined, { admit: claimFence(root) });
+  const claim = new ClaimLayer(other).claim("operation:claim-b", { workId: work.id, surface: local }).event;
+  assert.equal(claim.epoch, 1);
+  assert.equal(other.getWork(work.id).revision, 2, "the capture was committed before the claim");
+  assert.throws(() => new ClaimLayer(other).journal.readHeld(), /root write lock/, "held-only reads refuse without the lock");
+  assert.throws(() => other.getWorkSettledHeld(work.id), /root write lock/);
+});
+
+test("skill receipts bind the pointer epoch: old activation and rollback receipts never come back (no ABA)", () => {
+  const { root, skills, propose, validate } = skillSetup();
+  const activate = (op: string, versionId: string, decisionId: string, approvalRef: string) => skills.activate(op, { skillId: "observable", versionId, decisionId, approvalRef, surface: cloud });
+  const rollback = (op: string, toVersionId: string, approvalRef: string) => skills.rollback(op, { skillId: "observable", toVersionId, reason: "regressed", approvalRef, surface: cloud });
+  propose("v1", null);
+  const d1 = validate("v1").decisionId;
+  const a1 = cli(root, "approve-skill", "observable", "v1", d1).json;
+  assert.equal(a1.expectedPointerEpoch, 0);
+  activate("operation:act-v1", "v1", d1, a1.approval_ref);
+  propose("v2", "v1");
+  const d2 = validate("v2").decisionId;
+  const a2 = cli(root, "approve-skill", "observable", "v2", d2).json;
+  assert.equal(a2.expectedPointerEpoch, 1);
+  activate("operation:act-v2", "v2", d2, a2.approval_ref);
+  const r1 = cli(root, "approve-rollback", "observable", "v1", "--reason", "regressed").json;
+  rollback("operation:rb-v1", "v1", r1.approval_ref);
+  assert.equal(skills.getSkill("observable").pointer_epoch, 3);
+  assert.throws(() => activate("operation:act-v2-again", "v2", d2, a2.approval_ref), /pointer epoch 1; the pointer is now at epoch 3/, "the old v1→v2 receipt is dead");
+  const a2b = cli(root, "approve-skill", "observable", "v2", d2).json;
+  activate("operation:act-v2-fresh", "v2", d2, a2b.approval_ref);
+  assert.throws(() => rollback("operation:rb-v1-again", "v1", r1.approval_ref), /pointer epoch 2; the pointer is now at epoch 4/, "the old rollback receipt is dead too");
+  assert.equal(skills.getSkill("observable").active?.version_id, "v2");
 });

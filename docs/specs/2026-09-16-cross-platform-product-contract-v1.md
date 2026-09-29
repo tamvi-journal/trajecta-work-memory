@@ -267,7 +267,7 @@ Until `trajectad` exists, and underneath it afterwards, the core serialises ever
 
 ### Work claims: the lease in core (2026-09-29)
 
-The lease above is implemented as a **work claim** (`claims` domain journal): holder = surface kind + name + session, epoch, `expiresAt`. Claiming or renewing never changes the work revision. The store's admission hook (`admit`) checks the claim under the root lock after replay, recovery and re-read, before CAS, for capture/resume/close (not open). While a claim is live, only its holder with the exact epoch may mutate; the epoch never resets. Claims are explicit in this phase; moving a claim inside handoff/resume needs a composite crash-safe transaction and is deferred. See `docs/specs/2026-09-29-phase3-cases-skills-claims.md`.
+The lease above is implemented as a **work claim** (`claims` domain journal): holder = surface kind + name + session, epoch, `expiresAt`. Claiming or renewing never changes the work revision. The store's admission hook (`admit`) checks the claim under the root lock after replay, recovery and re-read, before CAS, for capture/resume/close (not open). While a claim is live, only its holder with the exact epoch may mutate; the epoch never resets. Claims are explicit in this phase; moving a claim inside handoff/resume needs a composite crash-safe transaction and is deferred. A claim is granted only after pending store operations are settled. **Deployment invariant:** the claim guarantee holds only when every writer on the root runs a fenced store (the MCP server does); a raw or custom `TrajectaStore` without the admit hook does not obey claims and MUST NOT share a root with claim users. See `docs/specs/2026-09-29-phase3-cases-skills-claims.md`.
 
 ---
 

@@ -60,15 +60,16 @@ One domain journal `skills.jsonl` → `skill-index.json`, with typed events. Ids
   - A duplicate versionId is refused.
 - **validation**: decisionId (server-generated), skillId, versionId, outcome (accepted | rejected | blocked | expired), baseline and candidate scores in [0,1], evidenceRefs, reason, validator. `accepted` requires candidate > baseline strictly **and a validator session different from the proposer session** (D2). Proposer and validator are stamped by the server. Only an accepted, agent-attested, independent validation is `eligible` to back an activation; rejected/blocked/expired need no independence.
 - **activate**: owner receipt `trajecta.owner-approval-receipt/v1`, purpose `skill_activation`.
-  - The receipt binds skillId, versionId, expectedParentVersionId, decisionId and contentDigest.
+  - The receipt binds skillId, versionId, expectedParentVersionId, **expectedPointerEpoch**, decisionId and contentDigest.
+  - Each skill has a `pointerEpoch`: 0 until the first activation, +1 on every activation and rollback, never reset (imported skills have no active pointer, so they start at 0). Activation and rollback receipts bind the epoch at issue time and the locked re-check requires it exactly, so after any pointer move an older receipt is dead. Without it, v1 → v2 → rollback v1 would revive the old v1→v2 receipt (ABA) and let two old receipts toggle policy forever.
   - The CLI `trajecta approve-skill <skill> <version> <decision>` refuses unless the decision is an eligible validation of that exact version, and the version's parent equals the current active pointer (or both are null).
   - Activation is CAS on the pointer, so only a direct child of the active version can activate. There is one active version per skill.
-- **rollback**: owner receipt purpose `skill_rollback`, binding skillId, from, to and a reason digest. `from` must be the current pointer; `to` must have been active before.
+- **rollback**: owner receipt purpose `skill_rollback`, binding skillId, from, to, expectedPointerEpoch and a reason digest. `from` must be the current pointer; `to` must have been active before.
 - Both activate and rollback follow the three-stage promotion shape: locked replay → pure validation → unlocked resolve → locked recheck + append.
 
 **Agents see:**
 
-- `work_context` normal gets `active_skills` for the work's cluster: id, version, title, contentDigest. No content.
+- `work_context` normal gets `active_skills` for the work's cluster: skill id, active version id, content digest and pointer epoch. No content, no title (versions have none; `work_skill_get` returns the content).
 - `work_skill_get(skill_id)` returns the active content; with `mode: audit` it adds the history.
 - **Candidates never reach normal context.**
 
@@ -89,6 +90,8 @@ This is not AWM's controller-authority/successor machinery, which is local-execu
 - Fence: while a live claim exists, `capture` (and so handoff), `resume` and `close` from anyone except the holder (surface kind, name, session) are refused (`ClaimConflict`). The holder must pass the exact `claim_epoch`. With no live claim, passing an epoch is refused (the caller's claim was released or expired); passing none leaves behaviour unchanged.
 - Handoff protocol for now: the sender releases, the receiver claims, then resumes with its epoch.
 - `work_claim` is refused on a store without the fence, so a claim never pretends to protect anything.
+- A claim is granted only on settled state: under the root lock, `claim` first finishes any reserved-but-uncommitted store operation through the core's held-only boundary (`store.getWorkSettledHeld`), then decides. A close that crashed after its reservation is completed first and the claim is refused ("Closed work cannot be claimed"); no claim is left on terminal work. The WAL logic stays in the store.
+- **Deployment invariant:** the guarantee holds only if every writer on a root runs a fenced store (`admit: claimFence(root)`). The MCP server (`runStdio`) does. A raw or custom `TrajectaStore` without the hook does not obey claims.
 
 ## Store hook (D3)
 

@@ -40,6 +40,8 @@ export interface SkillActivationReceipt {
   versionId: string;
   /** The active version this one replaces (its parent); null for a skill's first activation. */
   expectedParentVersionId: string | null;
+  /** The skill's pointer epoch when the owner approved; any pointer move invalidates the receipt. */
+  expectedPointerEpoch: number;
   decisionId: string;
   contentDigest: string;
   authority: "owner";
@@ -57,6 +59,7 @@ export interface SkillRollbackReceipt {
   skillId: string;
   fromVersionId: string;
   toVersionId: string;
+  expectedPointerEpoch: number;
   reasonDigest: string;
   authority: "owner";
   outcome: "approved";
@@ -183,7 +186,7 @@ function assertOwnerCommon(receipt: Record<string, unknown>, reference: string, 
   if (receipt.expiresAt !== undefined && !(Date.parse(String(receipt.expiresAt)) > now.getTime())) throw reject("receipt has expired");
 }
 
-export function assertSkillActivation(value: unknown, expected: { reference: string; skillId: string; versionId: string; expectedParentVersionId: string | null; decisionId: string; contentDigest: string }, now: Date) {
+export function assertSkillActivation(value: unknown, expected: { reference: string; skillId: string; versionId: string; expectedParentVersionId: string | null; expectedPointerEpoch: number; decisionId: string; contentDigest: string }, now: Date) {
   const receipt = value as Record<string, unknown> | null | undefined;
   const reject = (reason: string) => new SkillApprovalRejected(reason);
   if (!receipt) throw reject("no receipt found for this reference");
@@ -191,11 +194,12 @@ export function assertSkillActivation(value: unknown, expected: { reference: str
   assertOwnerCommon(receipt, expected.reference, now, reject);
   if (receipt.skillId !== expected.skillId || receipt.versionId !== expected.versionId) throw reject("receipt is for a different skill version");
   if (receipt.expectedParentVersionId !== expected.expectedParentVersionId) throw reject("receipt expects a different active version");
+  if (receipt.expectedPointerEpoch !== expected.expectedPointerEpoch) throw reject(`receipt was issued at pointer epoch ${String(receipt.expectedPointerEpoch)}; the pointer is now at epoch ${expected.expectedPointerEpoch}`);
   if (receipt.decisionId !== expected.decisionId) throw reject("receipt names a different validation");
   if (receipt.contentDigest !== expected.contentDigest) throw reject("receipt approves different content");
 }
 
-export function assertSkillRollback(value: unknown, expected: { reference: string; skillId: string; fromVersionId: string; toVersionId: string; reasonDigest: string }, now: Date) {
+export function assertSkillRollback(value: unknown, expected: { reference: string; skillId: string; fromVersionId: string; toVersionId: string; expectedPointerEpoch: number; reasonDigest: string }, now: Date) {
   const receipt = value as Record<string, unknown> | null | undefined;
   const reject = (reason: string) => new SkillApprovalRejected(reason);
   if (!receipt) throw reject("no receipt found for this reference");
@@ -204,5 +208,6 @@ export function assertSkillRollback(value: unknown, expected: { reference: strin
   if (receipt.skillId !== expected.skillId || receipt.fromVersionId !== expected.fromVersionId || receipt.toVersionId !== expected.toVersionId) {
     throw reject("receipt is for a different rollback");
   }
+  if (receipt.expectedPointerEpoch !== expected.expectedPointerEpoch) throw reject(`receipt was issued at pointer epoch ${String(receipt.expectedPointerEpoch)}; the pointer is now at epoch ${expected.expectedPointerEpoch}`);
   if (receipt.reasonDigest !== expected.reasonDigest) throw reject("receipt approves a different reason");
 }

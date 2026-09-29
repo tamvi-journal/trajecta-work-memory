@@ -10,8 +10,10 @@
  *   session different from the proposer's (D2). The server stamps both from
  *   the surface it runs as. Imported validations are history: never eligible.
  * - Activation needs an owner receipt (`skill_activation`) bound to skill,
- *   version, expected parent, decision and content digest. It is a CAS on the
- *   active pointer: only a direct child of the active version activates.
+ *   version, expected parent, pointer epoch, decision and content digest. It
+ *   is a CAS on the active pointer: only a direct child of the active version
+ *   activates. The pointer epoch rises on every activation and rollback, so an
+ *   old receipt never becomes valid again after the pointer moves (no ABA).
  * - Rollback needs an owner receipt (`skill_rollback`) and can only return to
  *   a version that was active before.
  * - Candidates never reach normal context: agents see active versions only.
@@ -60,6 +62,8 @@ export interface ValidationRecord {
 export interface SkillRecord {
   cluster: string;
   active: string | null;
+  /** Rises by one on every activation or rollback; never resets. Owner receipts bind it. */
+  pointerEpoch: number;
   everActive: string[];
   versions: Record<string, VersionRecord>;
 }
@@ -83,8 +87,8 @@ type Body =
   | ({ type: "pattern"; patternId: string; surface: Surface; attestation: Attestation; provenance?: string[] } & Omit<PatternRevision, "recordedAt">)
   | ({ type: "version"; skillId: string; versionId: string; provenance?: string[] } & Omit<VersionRecord, "recordedAt">)
   | ({ type: "validation"; decisionId: string; provenance?: string[] } & Omit<ValidationRecord, "recordedAt">)
-  | { type: "activated"; skillId: string; versionId: string; previousVersionId: string | null; decisionId: string; approvalRef: string; surface: Surface }
-  | { type: "rolled_back"; skillId: string; fromVersionId: string; toVersionId: string; reason: string; evidenceRefs: string[]; approvalRef: string; surface: Surface };
+  | { type: "activated"; skillId: string; versionId: string; previousVersionId: string | null; pointerEpoch: number; decisionId: string; approvalRef: string; surface: Surface }
+  | { type: "rolled_back"; skillId: string; fromVersionId: string; toVersionId: string; pointerEpoch: number; reason: string; evidenceRefs: string[]; approvalRef: string; surface: Surface };
 
 export type SkillEvent = JournalEvent & Body;
 
@@ -105,7 +109,7 @@ export const SKILLS: DomainSpec<SkillIndex, SkillEvent> = {
       }
       case "version": {
         const { type: _t, skillId, versionId, id: _id, operationId: _op, recordedAt: _at, provenance: _p, ...record } = event;
-        const skill = own(index.skills, skillId) ?? { cluster: record.cluster, active: null, everActive: [], versions: {} };
+        const skill = own(index.skills, skillId) ?? { cluster: record.cluster, active: null, pointerEpoch: 0, everActive: [], versions: {} };
         skill.versions[versionId] = { ...record, recordedAt: at };
         index.skills[skillId] = skill;
         break;
@@ -121,6 +125,7 @@ export const SKILLS: DomainSpec<SkillIndex, SkillEvent> = {
         if (!skill) break;
         const to = event.type === "activated" ? event.versionId : event.toVersionId;
         skill.active = to;
+        skill.pointerEpoch = (skill.pointerEpoch ?? 0) + 1;
         if (!skill.everActive.includes(to)) skill.everActive.push(to);
         break;
       }
@@ -266,7 +271,7 @@ export class SkillLayer {
     if (skill.active !== version.parentVersionId) {
       throw new Error(`Only a direct child of the active version can activate: active is ${skill.active ?? "none"}, ${versionId}'s parent is ${version.parentVersionId ?? "none"}`);
     }
-    return { skillId, versionId, expectedParentVersionId: version.parentVersionId, decisionId, contentDigest: version.contentDigest };
+    return { skillId, versionId, expectedParentVersionId: version.parentVersionId, expectedPointerEpoch: skill.pointerEpoch ?? 0, decisionId, contentDigest: version.contentDigest };
   }
 
   /** Terms a rollback must bind. */
@@ -276,7 +281,7 @@ export class SkillLayer {
     if (!skill.active) throw new Error(`${skillId} has no active version to roll back`);
     if (toVersionId === skill.active) throw new Error(`${toVersionId} is already active`);
     if (!skill.everActive.includes(toVersionId)) throw new Error(`Rollback can only return to a version that was active before; ${toVersionId} never was`);
-    return { skillId, fromVersionId: skill.active, toVersionId, reasonDigest: reasonDigest(text(reason, "reason", 1_000)) };
+    return { skillId, fromVersionId: skill.active, toVersionId, expectedPointerEpoch: skill.pointerEpoch ?? 0, reasonDigest: reasonDigest(text(reason, "reason", 1_000)) };
   }
 
   /** Activate a version with an owner receipt. Locked replay → unlocked resolve → locked re-check + append. */
@@ -294,7 +299,7 @@ export class SkillLayer {
       const terms = this.activationTerms(this.journal.readHeld(), input.skillId, input.versionId, input.decisionId);
       assertSkillActivation(receipt, { reference: input.approvalRef, ...terms }, this.now());
       return { ...this.journal.appendHeld(operationId, request, () => ({
-        type: "activated" as const, skillId: terms.skillId, versionId: terms.versionId, previousVersionId: terms.expectedParentVersionId,
+        type: "activated" as const, skillId: terms.skillId, versionId: terms.versionId, previousVersionId: terms.expectedParentVersionId, pointerEpoch: terms.expectedPointerEpoch + 1,
         decisionId: terms.decisionId, approvalRef: input.approvalRef, surface: input.surface,
       })), replayed: false };
     }, this.options.lock);
@@ -316,7 +321,7 @@ export class SkillLayer {
       const terms = this.rollbackTerms(this.journal.readHeld(), input.skillId, input.toVersionId, input.reason);
       assertSkillRollback(receipt, { reference: input.approvalRef, ...terms }, this.now());
       return { ...this.journal.appendHeld(operationId, request, () => ({
-        type: "rolled_back" as const, skillId: terms.skillId, fromVersionId: terms.fromVersionId, toVersionId: terms.toVersionId,
+        type: "rolled_back" as const, skillId: terms.skillId, fromVersionId: terms.fromVersionId, toVersionId: terms.toVersionId, pointerEpoch: terms.expectedPointerEpoch + 1,
         reason: input.reason.trim(), evidenceRefs, approvalRef: input.approvalRef, surface: input.surface,
       })), replayed: false };
     }, this.options.lock);
@@ -327,7 +332,7 @@ export class SkillLayer {
     if (!cluster) return [];
     return Object.entries(this.journal.read().skills)
       .filter(([, skill]) => skill.cluster === cluster && skill.active)
-      .map(([skillId, skill]) => ({ skill_id: skillId, version_id: skill.active!, content_digest: skill.versions[skill.active!].contentDigest }));
+      .map(([skillId, skill]) => ({ skill_id: skillId, version_id: skill.active!, content_digest: skill.versions[skill.active!].contentDigest, pointer_epoch: skill.pointerEpoch ?? 0 }));
   }
 
   /** The active content of a skill; audit adds its whole history. */
@@ -337,7 +342,7 @@ export class SkillLayer {
     if (!skill) throw new Error(`Skill ${skillId} not found`);
     const active = skill.active ? skill.versions[skill.active] : null;
     return {
-      skill_id: skillId, cluster: skill.cluster,
+      skill_id: skillId, cluster: skill.cluster, pointer_epoch: skill.pointerEpoch ?? 0,
       active: active ? { version_id: skill.active, content: active.content, content_digest: active.contentDigest } : null,
       ...(mode === "audit" ? {
         ever_active: skill.everActive,

@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { withRootWriteLock, type LockOptions } from "./lock.ts";
+import { holdsRootWriteLock, withRootWriteLock, type LockOptions } from "./lock.ts";
 import type {
   AdmitContext,
   Branch,
@@ -820,6 +820,18 @@ export class TrajectaStore {
     const item = this.readState().work.find((candidate) => candidate.id === workId);
     if (!item) throw new Error("Work item not found");
     return structuredClone(item);
+  }
+
+  /**
+   * Read a work item after finishing every reserved-but-uncommitted store
+   * operation. For a layer that holds the root lock and must decide on
+   * settled state (a claim must never be granted on state a pending close is
+   * about to change). Refuses to run without the root lock.
+   */
+  getWorkSettledHeld(workId: string) {
+    if (!holdsRootWriteLock(this.root)) throw new Error("getWorkSettledHeld needs the root write lock held by the caller");
+    this.recoverPending();
+    return this.getWork(workId);
   }
 
   list() {
